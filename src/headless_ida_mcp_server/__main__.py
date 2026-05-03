@@ -1,4 +1,120 @@
-from .server import main
+"""CLI entry point.
+
+Parses CLI flags and writes them back to `os.environ`, then runs
+`resolve_config()` to validate required fields before importing `server`.
+
+`__init__.py` is intentionally side-effect-free w.r.t. validation: it only
+calls `load_dotenv()` so plain `import headless_ida_mcp_server` works in
+tests / tooling that do not have IDA configured. Required-field validation is
+deferred to `resolve_config()` (and the lazy `__getattr__` for
+`IDA_INSTALL_DIR`).
+
+CLI flag priority is higher than env. Unset flags do not clobber env.
+"""
+import argparse
+import os
+import sys
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="headless_ida_mcp_server",
+        description=(
+            "Headless IDA MCP server. CLI flags override values from .env / "
+            "environment. Unset flags fall back to env, then defaults."
+        ),
+    )
+    parser.add_argument(
+        "--ida-install-dir",
+        dest="ida_install_dir",
+        default=None,
+        help=(
+            "IDA Pro install directory (env: IDA_INSTALL_DIR). Required unless "
+            "the legacy IDA_PATH env is set. No default."
+        ),
+    )
+    parser.add_argument(
+        "--idb-path",
+        dest="idb_path",
+        default=None,
+        help=(
+            "Path to an IDB to auto-load at startup (env: IDB_PATH). "
+            "Default: empty (wait for set_binary_path tool call)."
+        ),
+    )
+    parser.add_argument(
+        "--plugin-paths",
+        dest="plugin_paths",
+        default=None,
+        help=(
+            "Colon-separated paths to inject at sys.path[0] after idalib "
+            "bootstrap so agents can `import <plugin>` via py_eval (env: "
+            "IDA_MCP_PLUGIN_PATHS). Example: /path/to/your-plugin or "
+            "/path/to/plugin-a:/path/to/plugin-b. Empty / unset = no injection. "
+            "Default: empty."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        dest="port",
+        default=None,
+        help="MCP server listen port (env: PORT). Default: 8888.",
+    )
+    parser.add_argument(
+        "--host",
+        dest="host",
+        default=None,
+        help="MCP server listen host (env: HOST). Default: 0.0.0.0.",
+    )
+    parser.add_argument(
+        "--transport",
+        dest="transport",
+        default=None,
+        choices=["sse", "stdio"],
+        help="MCP transport mode (env: TRANSPORT). Default: sse.",
+    )
+    return parser
+
+
+# Map argparse dest -> env var name. Order does not matter.
+_FLAG_TO_ENV = {
+    "ida_install_dir": "IDA_INSTALL_DIR",
+    "idb_path": "IDB_PATH",
+    "plugin_paths": "IDA_MCP_PLUGIN_PATHS",
+    "port": "PORT",
+    "host": "HOST",
+    "transport": "TRANSPORT",
+}
+
+
+def _apply_cli_to_env(args: argparse.Namespace) -> None:
+    """Write CLI flag values back to `os.environ` so downstream env readers
+    pick them up. Skip flags the user did not pass (value is None)."""
+    for dest, env_key in _FLAG_TO_ENV.items():
+        value = getattr(args, dest, None)
+        if value is not None:
+            os.environ[env_key] = str(value)
+
+
+def main() -> None:
+    parser = _build_parser()
+    # argparse on parse error: prints message to stderr and exits with code 2.
+    args = parser.parse_args()
+    _apply_cli_to_env(args)
+
+    # Validate required fields now, with a clean stderr message + exit 1 on
+    # failure rather than letting the ValueError traceback leak through.
+    from . import resolve_config
+    try:
+        resolve_config()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Import AFTER env is updated and validated.
+    from .server import main as server_main
+    server_main()
+
 
 if __name__ == "__main__":
-    main() 
+    main()

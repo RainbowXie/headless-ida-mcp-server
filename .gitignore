@@ -13,3 +13,12 @@ wheels/
 .cursor/
 .env
 exploit.py
+
+# IDA Pro generated files (databases, caches)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til

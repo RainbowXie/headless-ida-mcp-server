@@ -12,4 +12,4 @@ dependencies = [
     "pytest-asyncio>=0.26.0",
 ]
 [project.scripts]
-headless_ida_mcp_server = "headless_ida_mcp_server.server:main"
+headless_ida_mcp_server = "headless_ida_mcp_server.__main__:main"
