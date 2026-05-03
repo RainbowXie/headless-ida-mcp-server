@@ -65,7 +65,38 @@ from headless_ida_mcp_server.logger import logger
 from headless_ida_mcp_server import PORT, TRANSPORT
 from headless_ida_mcp_server.api_python import py_eval as _py_eval
 
-mcp = FastMCP("IDA MCP Server", port=PORT)
+_MCP_INSTRUCTIONS = """\
+This server analyzes binaries via IDA Pro headlessly. The MCP layer exposes
+84 tools and 11 resources backed by an in-process idalib SDK session.
+
+Workflow primer:
+1. Load a binary. If `IDB_PATH` was not set on server start, call
+   `set_binary_path(path="...")` first. Any tool that touches IDA state
+   returns `error: Binary path not set ...` until you do.
+2. Navigate. `list_funcs` / `lookup_funcs` / `xrefs_to` / `imports` /
+   `survey_binary` are the cheapest first-look tools. Use the resources
+   `ida://idb/metadata` / `ida://idb/segments` / `ida://idb/entrypoints`
+   for whole-IDB context.
+3. Read code. `decompile` returns hex-rays pseudocode; `disasm` returns
+   assembly; `basic_blocks` / `callees` / `callgraph` give structure.
+4. Annotate and persist. `rename` / `set_comments` / `append_comments` /
+   `set_type` / `define_func` mutate the IDB; `idb_save` writes them out.
+5. Use third-party tools. If `IDA_MCP_PLUGIN_PATHS` was set on server
+   start, the listed plugin checkout roots are on `sys.path`. Call
+   `py_eval(code="from <plugin> import api; ...")` to drive them, or to
+   run any other Python (idaapi, idautils, idc, ...) inside the server.
+
+Conventions:
+- Failures return strings starting with `error: ...`. The MCP transport is
+  never broken by exceptions.
+- `dbg_*` tools require a live debugger session that idalib does not host
+  by default. They return `error: Debugger not running` unless `dbg_start`
+  has been driven first; rely on static analysis tools instead.
+- Tool names and signatures track upstream `mrexodia/ida-pro-mcp`. See
+  README.md and docs/agent-quickstart.md for the full reference.
+"""
+
+mcp = FastMCP("IDA MCP Server", port=PORT, instructions=_MCP_INSTRUCTIONS)
 ida = None  # legacy `helper.IDA` handle, retained for v2 lifecycle tools
 
 # Register the vendored py_eval tool. FastMCP reads the function's type

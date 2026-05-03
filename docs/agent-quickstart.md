@@ -24,23 +24,48 @@ every CLI flag) see the main [README](../README.md).
 ## 2. One-time install
 
 ```bash
-cd /path/to/headless-ida-mcp-server
-
-# 1. Install the idapro wheel that ships with IDA Pro
+# Install the idapro wheel that ships with IDA Pro
 uv pip install /opt/ida-pro-9.3/idapro-*.whl
 
-# 2. Activate idalib so it knows where to find IDA
+# Activate idalib so it knows where to find IDA
 py-activate-idalib
-
-# 3. Install server dependencies
-uv sync
 ```
+
+That's it. No need to clone the server repo — `uvx` (next step) pulls and
+builds it from git on first run.
 
 ## 3. Wire into an MCP client
 
 ### Claude Code / Claude Desktop (stdio, recommended)
 
-Add to `~/.claude.json` (or your project's `.mcp.json`):
+Add to `~/.claude.json` (or your project's `.mcp.json`). The `uvx` form
+runs the server straight from git, no source clone required:
+
+```json
+{
+  "mcpServers": {
+    "ida": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/RainbowXie/headless-ida-mcp-server",
+        "headless_ida_mcp_server",
+        "--transport", "stdio"
+      ],
+      "env": {
+        "IDA_INSTALL_DIR": "/opt/ida-pro-9.3",
+        "IDB_PATH": "/path/to/sample.i64",
+        "IDA_MCP_PLUGIN_PATHS": "/path/to/plugin-a:/path/to/plugin-b"
+      }
+    }
+  }
+}
+```
+
+To pin a version, append `@<tag>` or `@<sha>` to the git URL (e.g.
+`git+https://github.com/RainbowXie/headless-ida-mcp-server@v0.2.0`).
+
+If you already cloned the repo for local edits, the source-clone form works
+too:
 
 ```json
 {
@@ -55,7 +80,7 @@ Add to `~/.claude.json` (or your project's `.mcp.json`):
       "env": {
         "IDA_INSTALL_DIR": "/opt/ida-pro-9.3",
         "IDB_PATH": "/path/to/sample.i64",
-        "IDA_MCP_PLUGIN_PATHS": "/path/to/your-plugin"
+        "IDA_MCP_PLUGIN_PATHS": "/path/to/plugin-a:/path/to/plugin-b"
       }
     }
   }
@@ -66,7 +91,7 @@ Add to `~/.claude.json` (or your project's `.mcp.json`):
 |---|---|---|
 | `IDA_INSTALL_DIR` | Yes | Path to your IDA Pro install root |
 | `IDB_PATH` | No | If set, the IDB auto-loads at startup. If empty, the agent must call the `set_binary_path` tool before any IDA-touching tool |
-| `IDA_MCP_PLUGIN_PATHS` | No | Colon-separated plugin checkout roots (PYTHONPATH-style). Each path is inserted at `sys.path[0]` so the agent can `from <plugin> import ...` via `py_eval` |
+| `IDA_MCP_PLUGIN_PATHS` | No | Colon-separated plugin checkout roots (PYTHONPATH-style), e.g. `/path/to/plugin-a:/path/to/plugin-b`. Each path is inserted at `sys.path[0]` so the agent can `from <plugin> import ...` via `py_eval`. Left = highest priority on `sys.path` |
 
 The server is `stdio`-mode here, meaning it lives as a child process of the
 agent's MCP client. When the client exits, the server exits too — fresh state

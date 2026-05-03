@@ -16,33 +16,46 @@ interactive plugin.
 
 ## Quick start
 
-Four steps to get a server running locally:
+You need IDA Pro >= 9.3 with the `idapro` Python wheel installed first. After
+that, two paths:
 
-1. Install the IDA Pro Python library wheel that ships with your IDA Pro
-   install. From inside the IDA Pro install directory:
+### Path A: `uvx` (recommended for end users — no source clone)
 
-   ```bash
-   uv pip install ./idapro-*.whl
-   ```
+```bash
+# Install the idapro wheel that ships with IDA Pro
+uv pip install /opt/ida-pro-9.3/idapro-*.whl
+py-activate-idalib
 
-2. Activate idalib so it can locate your IDA install:
+# Run the server straight from git, no clone needed
+IDA_INSTALL_DIR=/opt/ida-pro-9.3 \
+IDB_PATH=/path/to/sample.i64 \
+uvx --from git+https://github.com/RainbowXie/headless-ida-mcp-server \
+    headless_ida_mcp_server
+```
 
-   ```bash
-   py-activate-idalib
-   ```
+`uvx` caches the git checkout under `~/.cache/uv/`, builds an isolated venv,
+and runs the entry point. To pin a version, append `@<tag>` or `@<sha>` to
+the git URL.
 
-3. Copy the example env file and edit it for your machine:
+### Path B: clone the repo (for contributors / local edits)
 
-   ```bash
-   cp .env_example .env
-   # then edit .env: set IDA_INSTALL_DIR, optional IDB_PATH, IDA_MCP_PLUGIN_PATHS, PORT, etc.
-   ```
+```bash
+# 1. Install the idapro wheel
+uv pip install /opt/ida-pro-9.3/idapro-*.whl
+py-activate-idalib
 
-4. Start the server:
+# 2. Clone + sync
+git clone https://github.com/RainbowXie/headless-ida-mcp-server.git
+cd headless-ida-mcp-server
+uv sync
 
-   ```bash
-   uv run headless_ida_mcp_server
-   ```
+# 3. Configure
+cp .env_example .env
+# edit .env: set IDA_INSTALL_DIR, optional IDB_PATH, IDA_MCP_PLUGIN_PATHS, PORT, etc.
+
+# 4. Run
+uv run headless_ida_mcp_server
+```
 
 ## Configuration
 
@@ -83,6 +96,31 @@ uv run headless_ida_mcp_server --transport stdio
 Add the server to your MCP client config. Two transports are supported.
 
 ### stdio (recommended for desktop MCP clients)
+
+`uvx` form — no clone needed, the agent runtime starts the server straight
+from git:
+
+```json
+{
+  "mcpServers": {
+    "ida": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/RainbowXie/headless-ida-mcp-server",
+        "headless_ida_mcp_server",
+        "--transport", "stdio"
+      ],
+      "env": {
+        "IDA_INSTALL_DIR": "/opt/ida-pro-9.3",
+        "IDB_PATH": "/path/to/sample.i64",
+        "IDA_MCP_PLUGIN_PATHS": "/path/to/plugin-a:/path/to/plugin-b"
+      }
+    }
+  }
+}
+```
+
+Source-clone form — when you cloned the repo for local edits:
 
 ```json
 {

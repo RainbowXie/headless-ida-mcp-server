@@ -15,32 +15,44 @@
 
 ## 快速开始
 
-本地起一个 server 只需四步：
+需要 IDA Pro >= 9.3，并装好其自带的 `idapro` Python wheel。然后两条路：
 
-1. 安装 IDA Pro 自带的 idapro Python wheel。在 IDA Pro 安装目录里执行：
+### 路径 A：`uvx`（推荐给最终用户 —— 不用 clone 源码）
 
-   ```bash
-   uv pip install ./idapro-*.whl
-   ```
+```bash
+# 装 IDA Pro 自带的 idapro wheel
+uv pip install /opt/ida-pro-9.3/idapro-*.whl
+py-activate-idalib
 
-2. 激活 idalib，让它定位到你的 IDA 安装：
+# 直接从 git 跑 server，不需要 clone
+IDA_INSTALL_DIR=/opt/ida-pro-9.3 \
+IDB_PATH=/path/to/sample.i64 \
+uvx --from git+https://github.com/RainbowXie/headless-ida-mcp-server \
+    headless_ida_mcp_server
+```
 
-   ```bash
-   py-activate-idalib
-   ```
+`uvx` 会把 git checkout 缓存在 `~/.cache/uv/`，建一个隔离 venv，跑 entry
+point。要 pin 版本，git URL 后接 `@<tag>` 或 `@<sha>`。
 
-3. 拷一份 env 模板并按本机修改：
+### 路径 B：clone 仓库（贡献 / 本地改动用）
 
-   ```bash
-   cp .env_example .env
-   # 然后编辑 .env：设置 IDA_INSTALL_DIR、可选 IDB_PATH、IDA_MCP_PLUGIN_PATHS、PORT 等
-   ```
+```bash
+# 1. 装 idapro wheel
+uv pip install /opt/ida-pro-9.3/idapro-*.whl
+py-activate-idalib
 
-4. 启动 server：
+# 2. clone + sync
+git clone https://github.com/RainbowXie/headless-ida-mcp-server.git
+cd headless-ida-mcp-server
+uv sync
 
-   ```bash
-   uv run headless_ida_mcp_server
-   ```
+# 3. 配置
+cp .env_example .env
+# 编辑 .env：设置 IDA_INSTALL_DIR、可选 IDB_PATH、IDA_MCP_PLUGIN_PATHS、PORT 等
+
+# 4. 跑
+uv run headless_ida_mcp_server
+```
 
 ## 配置项
 
@@ -80,6 +92,30 @@ uv run headless_ida_mcp_server --transport stdio
 把 server 加到 MCP client 配置里，支持两种传输。
 
 ### stdio（桌面 MCP client 推荐）
+
+`uvx` 形式 —— 不需要 clone，agent runtime 直接从 git 起 server：
+
+```json
+{
+  "mcpServers": {
+    "ida": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/RainbowXie/headless-ida-mcp-server",
+        "headless_ida_mcp_server",
+        "--transport", "stdio"
+      ],
+      "env": {
+        "IDA_INSTALL_DIR": "/opt/ida-pro-9.3",
+        "IDB_PATH": "/path/to/sample.i64",
+        "IDA_MCP_PLUGIN_PATHS": "/path/to/plugin-a:/path/to/plugin-b"
+      }
+    }
+  }
+}
+```
+
+源码 clone 形式 —— 已经 clone 仓库做本地改动时：
 
 ```json
 {
