@@ -94,6 +94,9 @@ Conventions:
   has been driven first; rely on static analysis tools instead.
 - Tool names and signatures track upstream `mrexodia/ida-pro-mcp`. See
   README.md and docs/agent-quickstart.md for the full reference.
+- If `import <plugin>` fails after `IDA_MCP_PLUGIN_PATHS` was set, call
+  `py_eval(code="import sys; sys.path[:5]")` to verify the path was
+  injected at the front of `sys.path`.
 """
 
 mcp = FastMCP("IDA MCP Server", port=PORT, instructions=_MCP_INSTRUCTIONS)
