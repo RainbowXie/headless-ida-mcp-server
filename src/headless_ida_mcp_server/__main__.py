@@ -104,7 +104,7 @@ def main() -> None:
 
     # Validate required fields now, with a clean stderr message + exit 1 on
     # failure rather than letting the ValueError traceback leak through.
-    from . import resolve_config, _bootstrap_idalib
+    from . import resolve_config, _bootstrap_idalib, _inject_plugin_paths
     try:
         resolve_config()
     except ValueError as exc:
@@ -116,6 +116,14 @@ def main() -> None:
     # exits non-zero with a clear stderr message. Must happen BEFORE we import
     # `server` because `helper.py` imports `idapro` / `ida_*` at module load.
     _bootstrap_idalib()
+
+    # Inject IDA_MCP_PLUGIN_PATHS entries into sys.path so agents can
+    # `import <plugin>` via py_eval. Must run AFTER idalib bootstrap (plugins
+    # typically import `idapro` / `ida_*`, only resolvable once idalib's
+    # sys.path entries are in place) and BEFORE `from .server import main`.
+    # NEVER imports any plugin eagerly: agents drive the first import
+    # explicitly via py_eval.
+    _inject_plugin_paths()
 
     # Import AFTER env is updated, validated, and idalib is ready.
     from .server import main as server_main

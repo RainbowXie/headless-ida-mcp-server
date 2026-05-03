@@ -32,7 +32,7 @@ Four steps to get a server running locally:
 
    ```bash
    cp .env_example .env
-   # then edit .env: set IDA_INSTALL_DIR, optional IDB_PATH, PORT, etc.
+   # then edit .env: set IDA_INSTALL_DIR, optional IDB_PATH, IDA_MCP_PLUGIN_PATHS, PORT, etc.
    ```
 
 4. Start the server:
@@ -52,6 +52,7 @@ defaults.** Unset CLI flags do not clobber env values.
 | `IDA_INSTALL_DIR` | `--ida-install-dir` | Yes (or fallback `IDA_PATH`) | — | IDA Pro install directory, e.g. `/opt/ida-pro-9.3`. |
 | `IDA_PATH` | — | Deprecated | — | v1 field pointing at the `idat` binary. If set without `IDA_INSTALL_DIR`, the server infers `IDA_INSTALL_DIR = dirname(IDA_PATH)` and emits a deprecation warning. |
 | `IDB_PATH` | `--idb-path` | No | (empty) | IDB file to auto-load at startup. When empty, agent must call `set_binary_path` first. |
+| `IDA_MCP_PLUGIN_PATHS` | `--plugin-paths` | No | (empty) | Colon-separated paths (PYTHONPATH-style) injected at `sys.path[0]` after idalib bootstrap so agents can `import <plugin>` via `py_eval`. Empty / unset = no injection. See "Loading IDA plugins". |
 | `PORT` | `--port` | No | `8888` | MCP server listen port. |
 | `HOST` | `--host` | No | `0.0.0.0` | MCP server listen host. |
 | `TRANSPORT` | `--transport` | No | `sse` | MCP transport mode: `sse` or `stdio`. |
@@ -168,6 +169,78 @@ Resources return `{"error": "..."}` for the same reason. `set_binary_path`
 must be called (or `IDB_PATH` set) before any tool that touches IDA state
 — the missing-binary case returns
 `error: Binary path not set (call set_binary_path first; tool=...)`.
+
+## Loading IDA plugins
+
+Most IDA plugins ship as a directory you "drop into IDA's plugins/ folder"
+rather than as a `pip install`-able package. To let an MCP-connected agent
+`import <plugin>` via the `py_eval` tool, the server provides a generic
+sys.path injection mechanism — set `IDA_MCP_PLUGIN_PATHS` (or pass
+`--plugin-paths`) to a colon-separated list of plugin checkout roots.
+
+What the server does at startup:
+
+1. After idalib is initialized (`init_library` succeeded, `import idapro`
+   resolved), the bootstrap calls `_inject_plugin_paths()`.
+2. `IDA_MCP_PLUGIN_PATHS` is read from env / CLI flag. Empty / unset is a
+   strict no-op (no log, no warning, no `sys.path` change).
+3. The value is split on `:` (`PYTHONPATH`-style); empty tokens are
+   dropped. Each non-empty path is inserted at the **front** of
+   `sys.path`, in left-to-right order: writing
+   `IDA_MCP_PLUGIN_PATHS=/a:/b:/c` results in `sys.path[0..2] = [/a, /b, /c]`.
+4. Stdout shows one line per path:
+   `[plugin-paths] sys.path injected: <path> (exists: <bool>)`. If a path
+   does not exist, an additional `[plugin-paths] warning: <path> does not
+   exist` lands on stderr but the server still starts — general-purpose
+   IDA tools remain usable.
+
+**Invariant:** server startup never executes `import <plugin>`. IDA plugins
+typically have global side effects (register_action, hook installation,
+etc.); the first import is the agent's choice via `py_eval`, not the
+server's.
+
+### Why front-insert?
+
+`sys.path.insert(0, path)` ensures the user's plugin checkout shadows any
+stale pip-installed wheel of the same name — handy when developing a plugin
+locally while a wheel happens to be in your venv.
+
+### Examples
+
+Single plugin:
+
+```bash
+IDA_MCP_PLUGIN_PATHS=/path/to/your-plugin \
+  uv run headless_ida_mcp_server
+```
+
+```python
+# Agent-side pseudo-code:
+mcp.call_tool("py_eval", {"code": "from your_plugin import api; api.__file__"})
+```
+
+Multiple plugins (colon-separated; left = highest priority on `sys.path`):
+
+```bash
+IDA_MCP_PLUGIN_PATHS=/path/to/plugin-a:/path/to/HexRaysCodeXplorer \
+  uv run headless_ida_mcp_server
+```
+
+```python
+mcp.call_tool("py_eval", {"code": "import plugin_a; plugin_a.__file__"})
+mcp.call_tool("py_eval", {"code": "import HexRaysCodeXplorer"})
+```
+
+CLI flag form (equivalent to env, accepts the same colon-separated string):
+
+```bash
+uv run headless_ida_mcp_server \
+  --plugin-paths /path/to/plugin-a:/path/to/HexRaysCodeXplorer
+```
+
+If the plugin is `pip install`-able, you don't need this mechanism at all —
+`site-packages` is already on `sys.path`, and `IDA_MCP_PLUGIN_PATHS` can stay
+unset.
 
 ## Architecture notes
 

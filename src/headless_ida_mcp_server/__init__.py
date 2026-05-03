@@ -40,6 +40,7 @@ __all__ = [
     'TRANSPORT',
     'resolve_config',
     '_bootstrap_idalib',
+    '_inject_plugin_paths',
 ]
 
 _DEFAULT_PORT = 8888
@@ -331,6 +332,69 @@ def _cleanup_idalib() -> None:
             pass
     finally:
         _idb_open = False
+
+
+# ----------------------------------------------------------------------------
+# Generic plugin path injection
+# ----------------------------------------------------------------------------
+
+
+def _inject_plugin_paths() -> None:
+    """Insert each path in `IDA_MCP_PLUGIN_PATHS` at `sys.path[0]`.
+
+    Reads `IDA_MCP_PLUGIN_PATHS` (colon-separated, `PYTHONPATH`-style),
+    splits, drops empty tokens, and inserts each non-empty path at the
+    front of `sys.path`. We iterate **right-to-left** with
+    `sys.path.insert(0, p)` so the final ordering matches the user's
+    left-to-right writing order in the env var.
+
+    Sequence (matches `runtime-plugin-paths` spec):
+      1. Read `IDA_MCP_PLUGIN_PATHS` from `os.environ`. Empty / unset is a
+         strict no-op: no log, no warning, no `sys.path` change.
+      2. Split on `:`, drop empty tokens (covers leading / trailing /
+         consecutive `::`).
+      3. For each path right-to-left, `sys.path.insert(0, path)` — front
+         of path so the user's plugin checkout shadows any stale
+         pip-installed wheel of the same name.
+      4. For each path, log `[plugin-paths] sys.path injected: <path>
+         (exists: <bool>)` to stdout in left-to-right order so the visible
+         log mirrors the env writing order.
+      5. If a path is missing or not a directory, additionally print
+         `[plugin-paths] warning: <path> does not exist` to stderr — but
+         DO NOT exit. Server stays usable for tools that don't need any
+         plugin (general-purpose IDA tools remain fully functional).
+
+    INVARIANT: this function MUST NOT `import` any plugin. IDA plugins
+    typically have global side effects (register_action, hook
+    installation, etc.); the agent triggers the first import explicitly
+    via `py_eval`. Server startup never does it.
+    """
+    raw = os.environ.get("IDA_MCP_PLUGIN_PATHS", "")
+    if not raw:
+        return  # strict no-op: no log, no warning
+
+    # Drop empty tokens (leading / trailing / consecutive `::`).
+    paths = [p for p in raw.split(":") if p]
+    if not paths:
+        return
+
+    # Insert right-to-left so the final order matches env writing order.
+    for path in reversed(paths):
+        sys.path.insert(0, path)
+
+    # Log each path left-to-right (mirrors how the user wrote it).
+    for path in paths:
+        exists = os.path.isdir(path)
+        print(
+            f"[plugin-paths] sys.path injected: {path} (exists: {exists})",
+            flush=True,
+        )
+        if not exists:
+            print(
+                f"[plugin-paths] warning: {path} does not exist",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 # PEP 562 lazy module attributes. Reading `headless_ida_mcp_server.PORT` etc.
