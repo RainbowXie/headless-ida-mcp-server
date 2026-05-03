@@ -13,6 +13,29 @@ interactive plugin.
 
 > 中文版本见 [README_CN.md](./README_CN.md)。
 
+## Features
+
+- **Full upstream tool surface.** 84 MCP tools + 11 MCP resources vendored
+  verbatim from
+  [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp), covering
+  analysis (`decompile` / `disasm` / `xrefs_to` / `callgraph` / ...), memory,
+  types, structures, modify, stack, search, sigmaker, and debugger surfaces.
+  Re-synced ad-hoc as upstream evolves.
+- **Headless IDA fully driven by an agent.** Runs the IDA backend through
+  the in-process `idalib` SDK — no `idat` subprocess, no per-call spawn
+  overhead. One MCP connection drives a long agent session against one IDB.
+  Renames / comments / type changes persist to the IDB via `idb_save`.
+  When a client connects the server hands it an `instructions` field with
+  a 5-step workflow primer, so an agent gets to its first useful tool call
+  without reading any out-of-band docs.
+- **Any IDA plugin is importable.** Generic `IDA_MCP_PLUGIN_PATHS` env
+  (colon-separated, PYTHONPATH-style) gets each plugin checkout root
+  injected at `sys.path[0]` after idalib bootstrap. Agent calls
+  `py_eval(code="from <plugin> import api; ...")` to drive any plugin's
+  Python API — no per-plugin special-casing in the server, no packaging
+  required from the plugin author. The classic "drop into IDA's plugins/
+  folder" plugin layout works as-is.
+
 ## Quick start (5 lines)
 
 ```bash

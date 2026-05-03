@@ -12,6 +12,27 @@
 
 > English version see [README.md](./README.md).
 
+## 特性
+
+- **完整上游 MCP 工具面**。84 个 MCP tool + 11 个 MCP resource 直接 vendored
+  from [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)，
+  覆盖分析（`decompile` / `disasm` / `xrefs_to` / `callgraph` / ...）、
+  memory、types、structures、modify、stack、search、sigmaker、debugger
+  各类。随上游演进按需 ad-hoc resync。
+- **Headless IDA 完全由 agent 驱动**。通过进程内 `idalib` SDK 跑 IDA
+  后端 —— 没有 `idat` subprocess，没有 per-call spawn 开销。一次 MCP
+  连接驱动一整段 agent session 跑同一个 IDB。rename / comments / type
+  变更走 `idb_save` 持久化回 IDB。client 连上时 server 通过 `instructions`
+  字段把 5 步 workflow primer 推给 agent，**agent 不用读任何外部文档就能
+  发出第一个有效 tool call**。
+- **任意 IDA plugin 可被 import**。通用 `IDA_MCP_PLUGIN_PATHS` env（冒号
+  分隔，PYTHONPATH 风格）在 idalib bootstrap 之后把每个 plugin checkout
+  根路径插到 `sys.path[0]`。agent 调
+  `py_eval(code="from <plugin> import api; ...")` 即可驱动任意 plugin 的
+  Python API —— **server 这边不针对任何 plugin 做特殊处理**，**plugin
+  作者也不需要额外打包**。经典"丢进 IDA plugins/ 目录"的 plugin 布局
+  原样可用。
+
 ## 快速开始（5 行）
 
 ```bash
