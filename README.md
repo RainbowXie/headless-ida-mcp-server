@@ -11,6 +11,9 @@ Run an IDA Pro analysis backend headlessly and expose it as an MCP server.
 Useful when you want to drive IDA from a CLI / agent / CI rather than as an
 interactive plugin.
 
+> 中文版本见 [README_CN.md](./README_CN.md)。Agent quickstart see
+> [docs/agent-quickstart.md](./docs/agent-quickstart.md).
+
 ## Quick start
 
 Four steps to get a server running locally:
