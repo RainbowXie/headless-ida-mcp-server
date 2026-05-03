@@ -8,9 +8,16 @@ import struct
 from headless_ida_mcp_server.helper import IDA
 from headless_ida_mcp_server.logger import logger
 from headless_ida_mcp_server import PORT,TRANSPORT
+from headless_ida_mcp_server.api_python import py_eval as _py_eval
 
 mcp = FastMCP("IDA MCP Server", port=PORT)
 ida = None
+
+# Register the vendored py_eval tool. FastMCP reads the function's type
+# annotations and docstring to build the tool schema, and we register under
+# its native name so agents see `py_eval` in `list_tools`. See
+# `api_python.py` for the implementation and the "unsafe" disclaimer.
+mcp.tool()(_py_eval)
 
 @mcp.tool()
 def set_binary_path(path: Annotated[str, "Path to the binary file"]):

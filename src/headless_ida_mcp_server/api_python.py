@@ -1,0 +1,242 @@
+# vendored from mrexodia/ida-pro-mcp@40e94f36f94043fd1824661e32ad72a903ec9e2f, dated 2026-04-24
+# upstream path: src/ida_pro_mcp/ida_mcp/api_python.py
+#
+# adaptations vs upstream:
+#   - removed `from ..rpc import tool, unsafe` and the `@tool` / `@unsafe`
+#     decorators. headless-ida-mcp-server uses FastMCP and registers tools
+#     explicitly in `server.py` (`mcp.tool()(py_eval)`). The "unsafe" marker
+#     idea is preserved in the docstring so future MCP frameworks can read it.
+#   - removed `from ..sync import idasync` and the `@idasync` decorator. idalib
+#     runs in-process on the calling thread so no UI-thread sync is required.
+#   - replaced `from .utils import parse_address, get_function`. headless-ida-
+#     mcp-server doesn't ship those upstream helpers; bind them to `None` in
+#     the exec globals so users see a clean NameError if they reference them
+#     before the upstream `utils` is ported.
+#   - switched `str(value)` -> `repr(value)` for `result_value` so the
+#     `mcp-py-eval` spec scenario "string expression returns repr form"
+#     (`'hello' + ' world'` -> `"'hello world'"`) is satisfied. Upstream uses
+#     `str()`; spec is the contract.
+#   - dropped the upstream `py_exec_file` tool from this vendor (out of scope
+#     for `add-py-eval-tool`; see `sync-ida-pro-mcp-tools` for the full sync).
+"""Vendored py_eval: arbitrary Python evaluation in the server process.
+
+Marked "unsafe" upstream because it is **arbitrary code execution**. There is
+no sandbox, no timeout, no language restriction. Any caller of this MCP tool
+can read/write the IDB, hit the filesystem, spawn processes, and import any
+module visible on `sys.path` (which by design includes the loaded `idalib`
+modules plus any plugin paths the operator injected via
+`IDA_MCP_PLUGIN_PATHS`). MCP clients that surface this tool to an untrusted
+agent SHOULD treat it accordingly.
+"""
+from typing import Annotated, TypedDict
+import ast
+import io
+import sys
+
+import idaapi
+import idc
+import ida_bytes
+import ida_dbg
+import ida_entry
+import ida_frame
+import ida_funcs
+import ida_hexrays
+import ida_ida
+import ida_kernwin
+import ida_lines
+import ida_nalt
+import ida_name
+import ida_segment
+import ida_typeinf
+import ida_xref
+
+
+# ============================================================================
+# Shared execution context
+# ============================================================================
+
+
+def _make_exec_globals() -> dict:
+    """Build an execution context with all IDA modules available."""
+
+    def lazy_import(module_name):
+        try:
+            return __import__(module_name)
+        except Exception:
+            return None
+
+    return {
+        "__builtins__": __builtins__,
+        "idaapi": idaapi,
+        "idc": idc,
+        "idautils": lazy_import("idautils"),
+        "ida_allins": lazy_import("ida_allins"),
+        "ida_auto": lazy_import("ida_auto"),
+        "ida_bitrange": lazy_import("ida_bitrange"),
+        "ida_bytes": ida_bytes,
+        "ida_dbg": ida_dbg,
+        "ida_dirtree": lazy_import("ida_dirtree"),
+        "ida_diskio": lazy_import("ida_diskio"),
+        "ida_entry": ida_entry,
+        "ida_expr": lazy_import("ida_expr"),
+        "ida_fixup": lazy_import("ida_fixup"),
+        "ida_fpro": lazy_import("ida_fpro"),
+        "ida_frame": ida_frame,
+        "ida_funcs": ida_funcs,
+        "ida_gdl": lazy_import("ida_gdl"),
+        "ida_graph": lazy_import("ida_graph"),
+        "ida_hexrays": ida_hexrays,
+        "ida_ida": ida_ida,
+        "ida_idd": lazy_import("ida_idd"),
+        "ida_idp": lazy_import("ida_idp"),
+        "ida_ieee": lazy_import("ida_ieee"),
+        "ida_kernwin": ida_kernwin,
+        "ida_libfuncs": lazy_import("ida_libfuncs"),
+        "ida_lines": ida_lines,
+        "ida_loader": lazy_import("ida_loader"),
+        "ida_merge": lazy_import("ida_merge"),
+        "ida_mergemod": lazy_import("ida_mergemod"),
+        "ida_moves": lazy_import("ida_moves"),
+        "ida_nalt": ida_nalt,
+        "ida_name": ida_name,
+        "ida_netnode": lazy_import("ida_netnode"),
+        "ida_offset": lazy_import("ida_offset"),
+        "ida_pro": lazy_import("ida_pro"),
+        "ida_problems": lazy_import("ida_problems"),
+        "ida_range": lazy_import("ida_range"),
+        "ida_regfinder": lazy_import("ida_regfinder"),
+        "ida_registry": lazy_import("ida_registry"),
+        "ida_search": lazy_import("ida_search"),
+        "ida_segment": ida_segment,
+        "ida_segregs": lazy_import("ida_segregs"),
+        "ida_srclang": lazy_import("ida_srclang"),
+        "ida_strlist": lazy_import("ida_strlist"),
+        "ida_struct": lazy_import("ida_struct"),
+        "ida_tryblks": lazy_import("ida_tryblks"),
+        "ida_typeinf": ida_typeinf,
+        "ida_ua": lazy_import("ida_ua"),
+        "ida_undo": lazy_import("ida_undo"),
+        "ida_xref": ida_xref,
+        "ida_enum": lazy_import("ida_enum"),
+        # Upstream binds these to `.utils.parse_address` / `.utils.get_function`.
+        # Not vendored yet (see header note); leave as None so a NameError
+        # surfaces clearly if someone tries to use them.
+        "parse_address": None,
+        "get_function": None,
+    }
+
+
+class PythonExecResult(TypedDict):
+    result: str
+    stdout: str
+    stderr: str
+
+
+# ============================================================================
+# Python Evaluation
+# ============================================================================
+
+
+def py_eval(
+    code: Annotated[str, "Python code"],
+) -> PythonExecResult:
+    """Execute Python in IDA context and return result/stdout/stderr.
+
+    Behaves like a Jupyter-style cell:
+      - parses `code` with `ast.parse`
+      - if the trailing node is an expression, eval()s it and stores
+        `repr(value)` in `result`
+      - otherwise exec()s everything; `result` is the repr of the explicit
+        `result` variable if set, else the last-assigned local
+      - stdout / stderr are captured to StringIO and returned as strings;
+        the original handles are restored in `finally`
+      - any exception (including SyntaxError from ast.parse fallback) is
+        caught; its traceback goes into `stderr` and `result` is `""`. The
+        MCP layer never sees a thrown exception.
+
+    NOTE: marked "unsafe" — arbitrary code execution. See module docstring.
+    """
+    # Capture stdout/stderr
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+
+    try:
+        sys.stdout = stdout_capture
+        sys.stderr = stderr_capture
+
+        exec_globals = _make_exec_globals()
+
+        result_value = None
+        exec_locals = {}
+
+        # Parse code with AST to properly handle execution
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # If parsing fails, fall back to direct exec (will re-raise the
+            # same SyntaxError, captured by the outer try/except below).
+            exec(code, exec_globals, exec_locals)
+            exec_globals.update(exec_locals)
+            if "result" in exec_locals:
+                result_value = repr(exec_locals["result"])
+            elif exec_locals:
+                last_key = list(exec_locals.keys())[-1]
+                result_value = repr(exec_locals[last_key])
+        else:
+            if not tree.body:
+                # Empty code
+                pass
+            elif len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+                # Single expression - use eval
+                result_value = repr(eval(code, exec_globals))
+            elif isinstance(tree.body[-1], ast.Expr):
+                # Multiple statements, last one is an expression (Jupyter-style)
+                # Execute all statements except the last
+                if len(tree.body) > 1:
+                    exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+                    exec(
+                        compile(exec_tree, "<string>", "exec"),
+                        exec_globals,
+                        exec_locals,
+                    )
+                    exec_globals.update(exec_locals)
+                # Eval only the last expression
+                eval_tree = ast.Expression(body=tree.body[-1].value)
+                result_value = repr(
+                    eval(compile(eval_tree, "<string>", "eval"), exec_globals)
+                )
+            else:
+                # All statements (no trailing expression)
+                exec(code, exec_globals, exec_locals)
+                exec_globals.update(exec_locals)
+                # Return 'result' variable if explicitly set
+                if "result" in exec_locals:
+                    result_value = repr(exec_locals["result"])
+                # Return last assigned variable
+                elif exec_locals:
+                    last_key = list(exec_locals.keys())[-1]
+                    result_value = repr(exec_locals[last_key])
+
+        # Collect output
+        stdout_text = stdout_capture.getvalue()
+        stderr_text = stderr_capture.getvalue()
+
+        return {
+            "result": result_value or "",
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+        }
+
+    except Exception:
+        import traceback
+
+        return {
+            "result": "",
+            "stdout": stdout_capture.getvalue(),
+            "stderr": traceback.format_exc(),
+        }
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
