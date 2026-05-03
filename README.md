@@ -35,6 +35,13 @@ interactive plugin.
   Python API — no per-plugin special-casing in the server, no packaging
   required from the plugin author. The classic "drop into IDA's plugins/
   folder" plugin layout works as-is.
+- **Built for autonomous agent workflows.** Optimized for unattended,
+  long-running, batch analysis: no MCP elicitation (server never
+  interrupts the agent to ask a human), no foreground / background
+  prompts, no confirmation dialogs. Failures are returned as
+  `error: ...` strings instead of being raised into the transport, so a
+  bad tool call never drops the connection or stops a multi-step
+  workflow. Connect once, hand the agent a goal, walk away.
 
 ## Quick start (5 lines)
 

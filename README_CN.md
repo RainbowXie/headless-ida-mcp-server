@@ -32,6 +32,11 @@
   Python API —— **server 这边不针对任何 plugin 做特殊处理**，**plugin
   作者也不需要额外打包**。经典"丢进 IDA plugins/ 目录"的 plugin 布局
   原样可用。
+- **为 agent 自动化工作流打造**。专为 **unattended / 长跑 / 批量分析**
+  优化：**不走 MCP elicitation**（server 永远不会中途打断 agent 找真人
+  确认），没有前台/后台询问、没有确认对话框。失败统一返回
+  `error: ...` 字符串而**不是抛进 MCP transport**，单个 tool 失败不会
+  断连接、不会中止多步工作流。连一次，扔个目标给 agent，关掉终端走人。
 
 ## 快速开始（5 行）
 
