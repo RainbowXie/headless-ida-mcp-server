@@ -2,8 +2,8 @@
 
 This project builds upon the work of:
 - Tools code adapted from [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) by mrexodia
-- Utilizes the [headless-ida](https://github.com/DennyDai/headless-ida) library by DennyDai
-- Fork and develop from [headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server) by cnitlrt
+- idalib rewrite based on [headless-ida-mcp-server](https://github.com/A1Lin/headless-ida-mcp-server) by A1Lin
+- Lineage starts from [headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server) by cnitlrt
 
 # Headless IDA MCP Server
 
@@ -29,6 +29,10 @@ uvx --python 3.12 \
 That's it. Server is up, IDB is loaded, 84 MCP tools and 11 resources are
 exposed. Connect any MCP client and start analyzing.
 
+When an MCP client connects, the server hands it an `instructions` field
+containing the 5-step workflow primer + error conventions, so an agent can
+get to its first useful tool call without reading any other docs.
+
 ## Full reference
 
 The detailed reference — every env / CLI flag, MCP client config snippets,
@@ -37,20 +41,13 @@ troubleshooting — lives in
 **[docs/agent-quickstart.md](./docs/agent-quickstart.md)**. Read that for
 anything beyond the 5-line quickstart above.
 
-## Architecture notes
+## Architecture
 
-This fork tracks two execution lines:
-
-- **v1**: original implementation forked from
-  [cnitlrt/headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server),
-  using the `headless_ida` library to spawn `idat` per call. Async support
-  added on top.
-- **v2** (current default): rewrites all helpers in `helper.py` against the
-  in-process `idalib` SDK. Removes the `headless_ida` dependency and the
-  per-call `idat` startup, dramatically improving tool latency.
-
-`IDA_INSTALL_DIR` (replacing the legacy `IDA_PATH`) drives both lines: v1
-uses it to locate `idat`, v2 hands it to idalib activation.
+In-process `idalib` SDK runs the IDA backend; FastMCP exposes the analysis
+surface as 84 MCP tools and 11 MCP resources. Tool layer is vendored from
+[`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) and
+re-synced ad-hoc as upstream evolves. No `idat` subprocess, no per-call
+spawn overhead — connect once, drive a long agent session against one IDB.
 
 ## Prerequisites
 
@@ -58,14 +55,14 @@ uses it to locate `idat`, v2 hands it to idalib activation.
 - IDA Pro >= 9.3 with the `idapro` Python wheel
   ([idalib docs](https://docs.hex-rays.com/user-guide/idalib))
 - [`uv`](https://github.com/astral-sh/uv) (for `uvx`)
-- v1 only: `headless_ida` and an accessible `idat` binary
-  ([DennyDai/headless-ida](https://github.com/DennyDai/headless-ida))
 
-## Contributors
+## Contributing
 
-Contributing patches? Clone the repo, `uv sync`, and follow the contributor
-flow in [docs/agent-quickstart.md](./docs/agent-quickstart.md). PRs land on
-the `v2` branch; `main` is the stable promotion target.
+End users follow the 5-line `uvx` quickstart above. **This Contributing
+section is only for people patching the server itself.** Clone the repo,
+`uv sync`, and follow the contributor flow in
+[docs/agent-quickstart.md](./docs/agent-quickstart.md). PRs land on the
+`v2` branch; `main` is the stable promotion target.
 
 ![](./images/pic.png)
 

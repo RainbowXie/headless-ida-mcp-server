@@ -18,13 +18,15 @@ debugger caveats, and troubleshooting all live here.
 - Python 3.12 or higher
 - IDA Pro >= 9.3 with idalib license (idalib is bundled — license is the gate)
 - [`uv`](https://github.com/astral-sh/uv) package manager (for `uvx`)
-- The `idapro` Python wheel that ships with IDA Pro. Real path on a stock
-  IDA 9.3 install is:
+- The `idapro` Python wheel that ships with IDA Pro. On a stock IDA 9.3
+  install the wheel lives at:
   ```
-  /opt/ida-pro-9.3/idalib/python/idapro-0.0.7-py3-none-any.whl
+  /opt/ida-pro-9.3/idalib/python/idapro-*.whl
   ```
-  (filename varies by version; use `find /opt/ida-pro-9.3 -name 'idapro-*.whl'`
-  if unsure)
+  Use a glob (above) so the command stays portable across IDA versions; if
+  your shell does not expand globs in this position, run
+  `find /opt/ida-pro-9.3 -name 'idapro-*.whl'` once and substitute the
+  exact filename.
 - Optional: clone of any IDA plugin you want to load via `IDA_MCP_PLUGIN_PATHS`
 
 ## 2. One-time install
@@ -93,7 +95,7 @@ defaults.** Unset CLI flags do not clobber env values.
 | Env | CLI flag | Required | Default | Purpose |
 |---|---|---|---|---|
 | `IDA_INSTALL_DIR` | `--ida-install-dir` | Yes (or fallback `IDA_PATH`) | — | IDA Pro install directory, e.g. `/opt/ida-pro-9.3`. |
-| `IDA_PATH` | — | Deprecated | — | v1 field pointing at the `idat` binary. If set without `IDA_INSTALL_DIR`, the server infers `IDA_INSTALL_DIR = dirname(IDA_PATH)` and emits a deprecation warning. |
+| `IDA_PATH` | — | Deprecated | — | Legacy env pointing at the `idat` binary. If set without `IDA_INSTALL_DIR`, the server infers `IDA_INSTALL_DIR = dirname(IDA_PATH)` and emits a deprecation warning. New deployments should set `IDA_INSTALL_DIR` directly. |
 | `IDB_PATH` | `--idb-path` | No | (empty) | IDB file to auto-load at startup. When empty, agent must call `set_binary_path` first. |
 | `IDA_MCP_PLUGIN_PATHS` | `--plugin-paths` | No | (empty) | Colon-separated paths (PYTHONPATH-style), e.g. `/path/to/plugin-a:/path/to/plugin-b`. Each is inserted at `sys.path[0]` after idalib bootstrap so agents can `import <plugin>` via `py_eval`. Left = highest priority on `sys.path`. Empty / unset = no injection. See §6. |
 | `PORT` | `--port` | No | `8888` | MCP server listen port. |
@@ -275,7 +277,7 @@ resources):
 
 | Group | Source | Examples |
 |---|---|---|
-| Lifecycle | fork-only | `set_binary_path`, `unset`, `py_eval` |
+| Lifecycle | fork-only | `set_binary_path`, `unset`, `py_eval` (call `unset` before re-`set_binary_path` to switch IDB) |
 | Core / metadata | `ida_mcp/api_core.py` | `server_health`, `lookup_funcs`, `list_funcs`, `imports`, `idb_save`, `find_regex`, `search_text` |
 | Analysis | `ida_mcp/api_analysis.py` | `decompile`, `disasm`, `xrefs_to`, `callees`, `callgraph`, `find_bytes`, `basic_blocks` |
 | Memory | `ida_mcp/api_memory.py` | `get_bytes`, `get_int`, `get_string`, `get_global_value`, `patch`, `put_int` |
@@ -370,6 +372,8 @@ plugin APIs, walk the database, mutate state.
 |---|---|
 | `IDA_INSTALL_DIR is not set` | Env not threaded into the MCP client config. Check the `env` field in `.mcp.json` / `~/.claude.json`. |
 | `Binary path not set` | `IDB_PATH` not set and `set_binary_path` never called. Either set the env, or have the agent call `set_binary_path(path="/path/to/idb")` first. |
+| `error: Binary path already set ...` | A previous `set_binary_path` left the IDB loaded. Call `unset()` first, then `set_binary_path` for the new IDB. |
+| Server log shows `D-810 PK initialized → Terminating ...` then `D-810 initialized → Terminating ...` at startup | Normal IDA plugin auto-discovery probe. If a directory you injected via `IDA_MCP_PLUGIN_PATHS` happens to be both a Python package AND an IDA plugin (with `PLUGIN_ENTRY`), idalib boots its plugin once and tears it down. Server itself is fine; agent-side `import <plugin>` still works. |
 | `from <plugin> import ...` raises `ImportError` | `IDA_MCP_PLUGIN_PATHS` does not include the plugin checkout root. Verify with `py_eval(code="import sys; sys.path[:5]")`. |
 | `ModuleNotFoundError: No module named 'idapro'` (when using `uvx`) | `--with <wheel>` was missing or pointed at wrong path. Run `find /opt/ida-pro-9.3 -name 'idapro-*.whl'` and use the actual wheel path. |
 | `error: Debugger not running` | Debug-only tool called without a live session. Either drive `dbg_start` first or use static analysis instead. |

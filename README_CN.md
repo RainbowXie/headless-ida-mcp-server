@@ -2,8 +2,8 @@
 
 本项目基于以下工作：
 - 工具代码改编自 mrexodia 的 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)
-- 使用了 DennyDai 的 [headless-ida](https://github.com/DennyDai/headless-ida) 库
-- Fork 自 cnitlrt 的 [headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server)，并在此基础上继续开发
+- idalib 重写基于 A1Lin 的 [headless-ida-mcp-server](https://github.com/A1Lin/headless-ida-mcp-server)
+- 血统起源于 cnitlrt 的 [headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server)
 
 # Headless IDA MCP Server
 
@@ -28,6 +28,9 @@ uvx --python 3.12 \
 跑起来就完事。Server 起来了，IDB 加载了，84 个 MCP tool + 11 个 resource
 暴露完毕。任意 MCP client 接上即可分析。
 
+MCP client 连上时 server 会通过 `instructions` 字段把 5 步 workflow + 错误
+约定推到 agent 的 system context，**agent 不读 README 也能直接出 tool call**。
+
 ## 详细参考
 
 每个 env / CLI flag、MCP client config snippet、84 个 tool 和 11 个
@@ -35,18 +38,13 @@ resource、plugin 加载机制、debugger 注意事项、排错 —— 全在
 **[docs/agent-quickstart.md](./docs/agent-quickstart.md)**。
 5 行 quickstart 之外的事都在那。
 
-## 架构说明
+## 架构
 
-本 fork 维护两条执行线：
-
-- **v1**：原始实现，fork 自
-  [cnitlrt/headless-ida-mcp-server](https://github.com/cnitlrt/headless-ida-mcp-server)，
-  通过 `headless_ida` 库每次调用都 spawn `idat`。在此基础上加了异步支持。
-- **v2**（当前默认）：基于进程内 `idalib` SDK 重写所有 helper。去掉
-  `headless_ida` 依赖和每次调用都启动 `idat` 的开销，工具时延显著改善。
-
-`IDA_INSTALL_DIR`（替代旧的 `IDA_PATH`）驱动两条线：v1 用它定位 `idat`，
-v2 把它交给 idalib 激活。
+进程内 `idalib` SDK 跑 IDA 后端；FastMCP 把分析能力暴露成 84 个 MCP tool
+和 11 个 MCP resource。工具层 vendored from
+[`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)，随上游
+按需 ad-hoc resync。没有 `idat` subprocess、没有 per-call spawn 开销 ——
+连一次 server，跑长 agent session 对同一个 IDB。
 
 ## 先决条件
 
@@ -54,12 +52,11 @@ v2 把它交给 idalib 激活。
 - IDA Pro >= 9.3，已装 `idapro` Python wheel
   （[idalib 文档](https://docs.hex-rays.com/user-guide/idalib)）
 - [`uv`](https://github.com/astral-sh/uv)（用于 `uvx`）
-- 仅 v1 需要：`headless_ida` 和可达的 `idat` 二进制
-  （[DennyDai/headless-ida](https://github.com/DennyDai/headless-ida)）
 
-## 贡献者
+## 贡献
 
-要提 patch？clone 本仓 + `uv sync`，按
+End user 按上面 5 行 uvx quickstart 走。**本节"贡献"只针对要 patch server
+本身的人**。clone 本仓 + `uv sync`，按
 [docs/agent-quickstart.md](./docs/agent-quickstart.md) 里的贡献者流程走。
 PR 落 `v2` 分支；`main` 是稳定 promote 目标。
 

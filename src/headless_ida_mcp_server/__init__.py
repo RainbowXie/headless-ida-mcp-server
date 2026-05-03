@@ -48,7 +48,8 @@ _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_TRANSPORT = "sse"
 
 # Load .env early so plain `import headless_ida_mcp_server` reflects file values.
-# `override=True` matches v1 behavior.
+# `override=True` ensures .env wins over an empty pre-existing env var so
+# operators can flip configuration without unsetting shell-level junk first.
 load_dotenv(find_dotenv(), override=True)
 
 
@@ -56,9 +57,10 @@ def _resolve_ida_install_dir() -> str:
     """Resolve `IDA_INSTALL_DIR` with backward-compatible `IDA_PATH` fallback.
 
     - Prefer explicit `IDA_INSTALL_DIR`.
-    - If unset, fall back to `dirname(IDA_PATH)` (v1 style where IDA_PATH points
-      at the `idat` binary). Emit a deprecation warning and write the inferred
-      value back to `os.environ` so downstream readers see a uniform field.
+    - If unset, fall back to `dirname(IDA_PATH)` (legacy env where IDA_PATH
+      points at the `idat` binary). Emit a deprecation warning and write the
+      inferred value back to `os.environ` so downstream readers see a uniform
+      field.
     - If neither is set, raise `ValueError` so the failure surfaces early.
     """
     install_dir = os.environ.get("IDA_INSTALL_DIR")
