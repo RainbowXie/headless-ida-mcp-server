@@ -104,14 +104,20 @@ def main() -> None:
 
     # Validate required fields now, with a clean stderr message + exit 1 on
     # failure rather than letting the ValueError traceback leak through.
-    from . import resolve_config
+    from . import resolve_config, _bootstrap_idalib
     try:
         resolve_config()
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
-    # Import AFTER env is updated and validated.
+    # Eager idalib bootstrap: load libidalib, init_library, sys.path setup,
+    # `import idapro`, and (if IDB_PATH set) `open_database`. Any failure
+    # exits non-zero with a clear stderr message. Must happen BEFORE we import
+    # `server` because `helper.py` imports `idapro` / `ida_*` at module load.
+    _bootstrap_idalib()
+
+    # Import AFTER env is updated, validated, and idalib is ready.
     from .server import main as server_main
     server_main()
 
