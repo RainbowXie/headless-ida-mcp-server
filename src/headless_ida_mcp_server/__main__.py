@@ -73,6 +73,21 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["sse", "stdio"],
         help="MCP transport mode (env: TRANSPORT). Default: sse.",
     )
+    parser.add_argument(
+        "--exclude-tags",
+        dest="exclude_tags",
+        default=None,
+        help=(
+            "Comma-separated fnmatch globs for capability tags. Tools / "
+            "resources whose tag list matches any glob are dropped from "
+            "the registered MCP surface (env: IDA_MCP_EXCLUDE_TAGS). "
+            "Examples: 'kind:write,kind:unsafe' (read-only mode), "
+            "'kind:unsafe' (allow normal writes but block destructive "
+            "tools), 'core::debug::*' (drop every dbg_* tool). Empty / "
+            "unset = no filtering. See docs/agent-quickstart.md "
+            "'Capability gating and undo' for the full tag taxonomy."
+        ),
+    )
     return parser
 
 
@@ -84,6 +99,11 @@ _FLAG_TO_ENV = {
     "port": "PORT",
     "host": "HOST",
     "transport": "TRANSPORT",
+    # exclude-tags participates in the same CLI > env > default
+    # precedence as the other flags. CLI explicitly passing --exclude-tags ""
+    # writes "" to env, which `parse_exclude_patterns` decodes as an empty
+    # list, achieving the spec's "CLI 显式空串覆盖 env" scenario.
+    "exclude_tags": "IDA_MCP_EXCLUDE_TAGS",
 }
 
 
@@ -104,12 +124,24 @@ def main() -> None:
 
     # Validate required fields now, with a clean stderr message + exit 1 on
     # failure rather than letting the ValueError traceback leak through.
-    from . import resolve_config, _bootstrap_idalib, _inject_plugin_paths
+    from . import (
+        resolve_config,
+        _bootstrap_idalib,
+        _inject_plugin_paths,
+        _install_stdio_isolation_if_needed,
+    )
     try:
         resolve_config()
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
+    # transport-stdio-isolation: when TRANSPORT=stdio, redirect OS fd 1 ->
+    # fd 2 BEFORE _bootstrap_idalib() so libidalib's C-layer printf and any
+    # auto-loaded ~/.idapro/plugins/ chatter never lands on the JSON-RPC
+    # channel that FastMCP's stdio writer reads. SSE mode skips the redirect
+    # so operator-visible idalib logs remain on the terminal stdout.
+    _install_stdio_isolation_if_needed()
 
     # Eager idalib bootstrap: load libidalib, init_library, sys.path setup,
     # `import idapro`, and (if IDB_PATH set) `open_database`. Any failure

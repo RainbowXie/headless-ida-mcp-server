@@ -14,8 +14,10 @@
 
 ## 特性
 
-- **完整上游 MCP 工具面**。84 个 MCP tool + 11 个 MCP resource 直接 vendored
-  from [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)，
+- **完整上游 MCP 工具面**。85 个 MCP tool + 11 个 MCP resource（其中 81
+  个 vendored from
+  [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)，4
+  个 fork-only —— `set_binary_path` / `unset` / `py_eval` / `undo`），
   覆盖分析（`decompile` / `disasm` / `xrefs_to` / `callgraph` / ...）、
   memory、types、structures、modify、stack、search、sigmaker、debugger
   各类。随上游演进按需 ad-hoc resync。
@@ -25,18 +27,43 @@
   变更走 `idb_save` 持久化回 IDB。client 连上时 server 通过 `instructions`
   字段把 5 步 workflow primer 推给 agent，**agent 不用读任何外部文档就能
   发出第一个有效 tool call**。
-- **任意 IDA plugin 可被 import**。通用 `IDA_MCP_PLUGIN_PATHS` env（冒号
-  分隔，PYTHONPATH 风格）在 idalib bootstrap 之后把每个 plugin checkout
-  根路径插到 `sys.path[0]`。agent 调
-  `py_eval(code="from <plugin> import api; ...")` 即可驱动任意 plugin 的
-  Python API —— **server 这边不针对任何 plugin 做特殊处理**，**plugin
-  作者也不需要额外打包**。经典"丢进 IDA plugins/ 目录"的 plugin 布局
-  原样可用。
+- **Plugin 通过 `mcp_manifest.py` 暴露强类型 MCP tool**。在你的 plugin
+  源码旁边放一个 `mcp_manifest.py`，server 用 `inspect.signature` 反射
+  每个 handler 的签名生成 MCP JSON Schema，自动接入 capability tag、
+  自动 undo（`kind:write`）、per-tool timeout。三条发现路径：pip entry
+  point（`[project.entry-points."headless_ida_mcp.plugins"]`）、
+  `~/.idapro/plugins/<name>/mcp_manifest.py`、以及
+  `IDA_MCP_PLUGIN_PATHS` 列出的每个目录。最小例子：
+
+  ```python
+  # mcp_manifest.py
+  def ping() -> dict:
+      return {"ok": True}
+
+  PLUGIN = {"name": "demo", "description": "Demo", "version": "0.1"}
+  TOOLS  = [{"name": "ping", "handler": ping, "description": "ping",
+             "tags": ["kind:read"]}]
+  ```
+
+  Agent 通过 `enable_plugin(name)` per-session 启用（server 自动发
+  `notifications/tools/list_changed`，client 重新拉 `list_tools`）。
+  无 manifest 的纯 Python plugin 仍可走 `IDA_MCP_PLUGIN_PATHS`
+  + `py_eval`。
 - **为 agent 自动化工作流打造**。专为 **unattended / 长跑 / 批量分析**
   优化：**不走 MCP elicitation**（server 永远不会中途打断 agent 找真人
   确认），没有前台/后台询问、没有确认对话框。失败统一返回
   `error: ...` 字符串而**不是抛进 MCP transport**，单个 tool 失败不会
   断连接、不会中止多步工作流。连一次，扔个目标给 agent，关掉终端走人。
+- **能力分级 + 自动 undo**。每个 tool 标 `kind:read` / `kind:write` /
+  `kind:unsafe`。`kind:write` 类 tool 在执行前自动建 `ida_undo` undo
+  point，agent 写错只要一次 `undo()` 调用就能回滚 —— 不用重开 IDB。
+  `kind:unsafe`（`patch` / `patch_asm` / `undefine` / `py_eval` /
+  `unset`）opt out —— `ida_undo` 救不回。运维方启动时用
+  `--exclude-tags`（或 `IDA_MCP_EXCLUDE_TAGS` env）选要不要砍：
+  `kind:write,kind:unsafe` 跑严格只读批量分析、`kind:unsafe` 保留写
+  但禁破坏性、`core::debug::*` 砍整套 `dbg_*` 调试面（没 debugger
+  的部署）。详见
+  [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) §11。
 
 ## 快速开始（5 行）
 
@@ -51,22 +78,24 @@ uvx --python 3.12 \
     headless_ida_mcp_server
 ```
 
-跑起来就完事。Server 起来了，IDB 加载了，84 个 MCP tool + 11 个 resource
-暴露完毕。任意 MCP client 接上即可分析。
+跑起来就完事。Server 起来了，IDB 加载了，最多 85 个 MCP tool + 11 个
+resource 暴露完毕（实际数量取决于 `--exclude-tags` 过滤配置）。任意 MCP
+client 接上即可分析。
 
 MCP client 连上时 server 会通过 `instructions` 字段把 5 步 workflow + 错误
 约定推到 agent 的 system context，**agent 不读 README 也能直接出 tool call**。
 
 ## 详细参考
 
-每个 env / CLI flag、MCP client config snippet、84 个 tool 和 11 个
-resource、plugin 加载机制、debugger 注意事项、排错 —— 全在
+每个 env / CLI flag、MCP client config snippet、85 个 tool 和 11 个
+resource、能力分级 tag + `undo()`、plugin 加载机制、debugger 注意事项、
+排错 —— 全在
 **[docs/agent-quickstart.md](./docs/agent-quickstart.md)**。
 5 行 quickstart 之外的事都在那。
 
 ## 架构
 
-进程内 `idalib` SDK 跑 IDA 后端；FastMCP 把分析能力暴露成 84 个 MCP tool
+进程内 `idalib` SDK 跑 IDA 后端；FastMCP 把分析能力暴露成 85 个 MCP tool
 和 11 个 MCP resource。工具层 vendored from
 [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)，随上游
 按需 ad-hoc resync。没有 `idat` subprocess、没有 per-call spawn 开销 ——

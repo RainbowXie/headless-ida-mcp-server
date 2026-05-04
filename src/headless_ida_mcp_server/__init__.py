@@ -41,6 +41,7 @@ __all__ = [
     'resolve_config',
     '_bootstrap_idalib',
     '_inject_plugin_paths',
+    '_install_stdio_isolation_if_needed',
 ]
 
 _DEFAULT_PORT = 8888
@@ -110,6 +111,134 @@ def resolve_config() -> dict:
 
 
 # ----------------------------------------------------------------------------
+# transport-stdio-isolation: redirect fd 1 -> fd 2 in stdio mode
+# ----------------------------------------------------------------------------
+
+# Tracks whether the stdio fd-redirect has already been applied. The redirect
+# is one-shot at bootstrap time; calling the helper twice MUST be a no-op so
+# tests / reentrancy do not leak fds or break the saved JSON-RPC channel.
+_stdio_isolation_done = False
+
+# Holds the line-buffered UTF-8 TextIOWrapper over the saved JSON-RPC fd
+# (fd that was originally fd 1 at process start, before `_install_stdio_
+# isolation_if_needed` redirected fd 1 to stderr). FastMCP's
+# `mcp.server.stdio.stdio_server()` reads it via the `stdout=` parameter
+# (see `MCPServer.run_stdio_async` for the wiring) so JSON-RPC frames go
+# back through the parent process's pipe even though `sys.stdout` is now
+# pointed at stderr to absorb plugin / library noise.
+_jsonrpc_writer = None
+
+
+def _install_stdio_isolation_if_needed() -> None:
+    """When `TRANSPORT=stdio`, redirect OS fd 1 -> fd 2 before idalib boots.
+
+    Rationale (see openspec capability `transport-stdio-isolation`): under
+    stdio transport the FastMCP server uses fd 1 as the JSON-RPC channel.
+    Three sources outside this fork's code can write to fd 1 and pollute
+    that channel:
+
+      - `libidalib.so` writes its banner from C via `printf`; this bypasses
+        Python's `sys.stdout` entirely.
+      - Any Python plugin auto-loaded from `~/.idapro/plugins/` (e.g.
+        D-810, `mrexodia/ida-pro-mcp` GUI variant) calls `print(...)` on
+        init / teardown; this DOES go through `sys.stdout`.
+      - Anything else that auto-loads under IDA's process that writes to
+        fd 1 (cosmetic banners, deprecation warnings, etc.).
+
+    A strict JSON-RPC client drops the connection on the first non-JSON
+    byte, so all three sources MUST be diverted. Mechanism (only when
+    `TRANSPORT=stdio`, BEFORE `_bootstrap_idalib`):
+
+      1. `saved_jsonrpc_fd = os.dup(1)` — save the original fd 1 (the
+         pipe the parent MCP client opened). This fd remains the JSON-RPC
+         channel for FastMCP.
+      2. `target_fd = sys.stderr.fileno()` (typically fd 2) — the
+         unconditional diagnostic target. There is no env / CLI knob.
+      3. `os.dup2(target_fd, 1)` — fd 1 now aliases stderr. Subsequent
+         C-layer `printf` and any Python `print()` (which writes to
+         `sys.stdout`, whose underlying fd is fd 1) goes to stderr.
+      4. Build `_jsonrpc_writer = os.fdopen(saved_jsonrpc_fd, "w",
+         buffering=1, encoding="utf-8", newline="")` — line-buffered UTF-8
+         text writer over the saved fd. FastMCP's stdio writer accepts a
+         `stdout=` argument; `MCPServer.run_stdio_async` passes
+         `_jsonrpc_writer` so JSON-RPC frames flow through the saved fd
+         and never touch fd 1 (now stderr).
+      5. Note: we intentionally do NOT rebind `sys.stdout`. Leaving it
+         alone (pointing at the now-redirected fd 1 = stderr) is what
+         absorbs the auto-loaded plugin `print()` calls. FastMCP gets
+         the JSON-RPC channel via the explicit `stdout=` argument
+         instead of via `sys.stdout.buffer`.
+
+    SSE mode (`TRANSPORT=sse`, the default) skips the redirect entirely so
+    operator-visible idalib logs continue to land on the terminal stdout.
+    """
+    global _stdio_isolation_done, _jsonrpc_writer
+    if _stdio_isolation_done:
+        return
+    if os.environ.get("TRANSPORT", _DEFAULT_TRANSPORT) != "stdio":
+        return
+
+    # Resolve diagnostic target fd (always stderr; no knob).
+    try:
+        target_fd = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        # If stderr has no real fd (highly unusual: e.g. tests replaced it
+        # with a StringIO), there is nothing meaningful to redirect to. Skip
+        # the redirect entirely rather than corrupt fd 1.
+        return
+
+    # Save original fd 1 — this remains the JSON-RPC channel.
+    try:
+        saved_jsonrpc_fd = os.dup(1)
+    except OSError:
+        # No fd 1 (e.g. detached). Nothing to isolate.
+        return
+
+    # Best-effort flush of the existing sys.stdout BEFORE we redirect fd 1
+    # so any already-buffered Python output reaches the parent's stdout
+    # (the JSON-RPC pipe) rather than getting lost when fd 1 changes.
+    # This buffer is normally empty at this point in main() but better
+    # safe than sorry.
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    # Point fd 1 at the diagnostic target (stderr). After this, every
+    # write to fd 1 (C-layer printf, Python `print()` via sys.stdout)
+    # lands on stderr.
+    try:
+        os.dup2(target_fd, 1)
+    except OSError:
+        # Restore original mapping if dup2 fails so we don't leak the dup.
+        try:
+            os.close(saved_jsonrpc_fd)
+        except OSError:
+            pass
+        return
+
+    # Build the JSON-RPC writer FastMCP will be handed via stdio_server's
+    # `stdout=` parameter. Line-buffered, UTF-8, no newline translation
+    # (each frame is already \n-terminated by FastMCP).
+    _jsonrpc_writer = os.fdopen(
+        saved_jsonrpc_fd,
+        mode="w",
+        buffering=1,
+        encoding="utf-8",
+        newline="",
+    )
+
+    _stdio_isolation_done = True
+
+
+def _get_jsonrpc_writer():
+    """Return the FastMCP stdio writer prepared by
+    `_install_stdio_isolation_if_needed()`, or None if isolation did not
+    run (SSE mode, or stdin/stdout shape did not allow the redirect)."""
+    return _jsonrpc_writer
+
+
+# ----------------------------------------------------------------------------
 # idalib bootstrap
 # ----------------------------------------------------------------------------
 
@@ -136,6 +265,27 @@ def _fail(msg: str) -> "None":
     """Print a clean error to stderr and exit non-zero."""
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def _diag_fd1(line: str) -> None:
+    """Write a diagnostic line directly to fd 1 (bypassing `sys.stdout`).
+
+    In SSE mode fd 1 is the operator's terminal stdout — exactly today's
+    behaviour. In stdio mode `_install_stdio_isolation_if_needed()` has
+    already pointed fd 1 at stderr, so the same write lands on stderr
+    where the operator wants startup diagnostics. Critically, this never
+    touches the saved JSON-RPC fd that `sys.stdout` now wraps in stdio
+    mode, keeping the JSON-RPC channel pristine.
+    """
+    try:
+        data = line.encode("utf-8", errors="replace")
+        # os.write is unbuffered: each call is one writev, no Python buffer
+        # ordering hazards relative to the C-layer printf interleaving.
+        os.write(1, data)
+    except OSError:
+        # fd 1 closed or otherwise broken; degrade silently — diagnostics
+        # are not load-bearing.
+        pass
 
 
 def _bootstrap_idalib() -> None:
@@ -188,7 +338,13 @@ def _bootstrap_idalib() -> None:
             f"init_library rc={rc} for {libpath!r}. Verify the IDA license is "
             f"installed (~/.idapro/idapro.hexlic) and matches this build."
         )
-    print(f"[idalib] init_library rc=0 ({libpath})", flush=True)
+    # Diagnostic line goes to fd 1 directly. In SSE mode fd 1 is the
+    # operator's terminal stdout (the original behaviour). In stdio mode
+    # `_install_stdio_isolation_if_needed()` has already pointed fd 1 at
+    # stderr, so this line lands on stderr where it belongs — `sys.stdout`
+    # in stdio mode IS the JSON-RPC channel and MUST NOT receive Python
+    # diagnostics.
+    _diag_fd1(f"[idalib] init_library rc=0 ({libpath})\n")
 
     # 4. Print version.
     try:
@@ -203,9 +359,8 @@ def _bootstrap_idalib() -> None:
         ]
         ver_fn.restype = ctypes.c_int
         ver_fn(ctypes.byref(major), ctypes.byref(minor), ctypes.byref(build))
-        print(
-            f"[idalib] version {major.value}.{minor.value}.{build.value}",
-            flush=True,
+        _diag_fd1(
+            f"[idalib] version {major.value}.{minor.value}.{build.value}\n"
         )
     except Exception as exc:
         # Non-fatal: just warn. Some idalib builds may not export this symbol.
@@ -256,7 +411,7 @@ def _bootstrap_idalib() -> None:
                 f"Check that the IDB is not corrupted and license covers it."
             )
         _idb_open = True
-        print(f"[idalib] opened: {idb_path}", flush=True)
+        _diag_fd1(f"[idalib] opened: {idb_path}\n")
 
     # 8. Register cleanup. SIGINT / SIGTERM under the default Python handlers
     # raise KeyboardInterrupt / propagate -> interpreter shutdown -> atexit.
@@ -279,11 +434,17 @@ def _bootstrap_idalib() -> None:
 def _signal_to_systemexit(signum, frame):  # noqa: ARG001 (frame unused)
     """SIGINT/SIGTERM handler that triggers a clean Python shutdown.
 
+    Run `_shutdown_idalib_now()` BEFORE `raise SystemExit(...)` so that the
+    OK / failure log line lands on a still-open stream. The atexit fallback
+    (`_cleanup_idalib`) becomes a quiet no-op afterwards thanks to the
+    `_shutdown_done` idempotency flag.
+
     Raising `SystemExit` from a signal handler runs the normal interpreter
     teardown sequence (atexit hooks fire, finally blocks run). We use
     `128 + signum` for the exit code, the POSIX convention for "killed by
     signal N".
     """
+    _shutdown_idalib_now()
     raise SystemExit(128 + signum)
 
 
@@ -318,22 +479,64 @@ def _install_shutdown_signal_handlers() -> None:
             pass
 
 
-def _cleanup_idalib() -> None:
-    """`atexit` hook: best-effort `close_database(False)`. Never re-raises."""
-    global _idb_open
+# Set by `_shutdown_idalib_now()` after a successful (or attempted) close so
+# the atexit fallback knows not to re-run. Required because the spec calls
+# the OK / failure print "once and only once" across signal-handler + atexit.
+_shutdown_done = False
+
+
+def _shutdown_idalib_now() -> None:
+    """Idempotent close_database. Called from signal handler and as atexit fallback.
+
+    Sequence:
+      - No-op if `_idapro_module is None` or `_idb_open is False` (matches
+        original `_cleanup_idalib` guards: nothing to close).
+      - No-op if `_shutdown_done` is already True (signal-handler path
+        already ran; atexit must not double-print).
+      - Otherwise: call `idapro.close_database(False)` and print
+        `[idalib] close_database(False) ok` (or the failure variant). Set
+        the idempotency flag and clear `_idb_open`.
+
+    Errors writing to stdout/stderr (e.g. `ValueError: I/O operation on
+    closed file` on the racy atexit-after-finalize path) are silently
+    swallowed — the spec mandates we do not let that error reach stderr.
+    """
+    global _idb_open, _shutdown_done
+    if _shutdown_done:
+        return
     if _idapro_module is None or not _idb_open:
         return
     try:
         _idapro_module.close_database(False)
-        print("[idalib] close_database(False) ok", flush=True)
+        try:
+            _diag_fd1("[idalib] close_database(False) ok\n")
+        except (ValueError, OSError):
+            # stdio already finalised; swallow per spec.
+            pass
     except Exception as exc:
-        # Swallow: process is exiting; we just log so the user sees the trace.
+        # Process is exiting; surface the trace to stderr if we still can.
         try:
             print(f"[idalib] close_database failed: {exc}", file=sys.stderr)
-        except Exception:
+        except (ValueError, OSError):
+            # stderr also finalised; nothing actionable to do.
             pass
     finally:
         _idb_open = False
+        _shutdown_done = True
+
+
+def _cleanup_idalib() -> None:
+    """atexit fallback: delegate to idempotent `_shutdown_idalib_now()`.
+
+    Silently swallow `ValueError` (the `I/O operation on closed file` race
+    when Python's stdio finaliser beat us) so the operator never sees the
+    cosmetic shutdown error in the natural-exit path.
+    """
+    try:
+        _shutdown_idalib_now()
+    except ValueError:
+        # Spec: never let `I/O operation on closed file` reach stderr.
+        pass
 
 
 # ----------------------------------------------------------------------------

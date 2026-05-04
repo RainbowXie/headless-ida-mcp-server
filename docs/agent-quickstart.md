@@ -190,6 +190,54 @@ Point the MCP client at the URL:
 Useful when multiple clients share one server, or when you want the server to
 outlive any single agent session.
 
+### stdio mode noise isolation
+
+Under `--transport stdio` the server's stdout (fd 1) IS the JSON-RPC channel
+the MCP client reads. Three sources unrelated to this fork's code path
+otherwise pollute that channel:
+
+- `libidalib.so` writes its own startup banner from C via `printf`
+  (`[idalib] init_library rc=0 ...`, `[idalib] version 9.3.260213`,
+  `[idalib] opened: ...`). These bypass `sys.stdout` and hit fd 1
+  directly, so a Python-level `sys.stdout` swap cannot suppress them.
+- Any IDA plugin auto-loaded from `~/.idapro/plugins/` may print on
+  `init` / `term` (D-810 PK's `D-810 PK initialized (version 0.11)` /
+  `Terminating D-810 PK...`, `mrexodia/ida-pro-mcp`'s
+  `[MCP] Plugin loaded, ...`, etc.). These are operator-installed
+  third-party plugins; the fork has no leverage over their output.
+- Anything else that auto-loads under IDA's process and writes to fd 1.
+
+A strict JSON-RPC client drops the connection on the first non-JSON
+line. To make stdio mode robust, the server, **only when
+`TRANSPORT=stdio` is resolved**, redirects fd 1 to fd 2 (stderr) before
+`_bootstrap_idalib()` runs. After the redirect:
+
+- The original fd 1 (the parent process's pipe) is preserved as
+  `sys.stdout`'s underlying fd. FastMCP's stdio writer continues to
+  write JSON-RPC frames to it, untouched.
+- Any subsequent `printf` from C, or any plugin that prints during
+  `init` / `term`, lands on stderr — the operator's terminal by default.
+- `sys.stderr` itself is untouched: the Python `logger` already writes
+  to stderr today and continues to.
+
+If you want a file capture of the stderr stream, use a standard shell
+redirection — the server does not own a `--diag-target=` knob:
+
+```bash
+TRANSPORT=stdio IDB_PATH=/path/to/sample.i64 \
+  uvx headless_ida_mcp_server --transport stdio 2>>/tmp/headless-ida.diag.log
+```
+
+`TRANSPORT=sse` mode skips the redirect entirely. fd 1 keeps its
+original meaning, and `[idalib] init_library rc=0` etc. remain visible
+on the operator's terminal — useful as a sanity check that the IDA
+install is correctly wired.
+
+The fork cannot suppress the third-party plugins' print behaviour at
+its source; the fd-level redirect is the only lever the server has.
+See §6 for the difference between the two plugin-loading mechanisms
+that produce these lines.
+
 ### Debugging
 
 Use the MCP Inspector to poke the running server interactively:
@@ -198,86 +246,138 @@ Use the MCP Inspector to poke the running server interactively:
 npx -y @modelcontextprotocol/inspector
 ```
 
-## 6. Loading IDA plugins
+## 6. Plugin loading
 
-Most IDA plugins ship as a directory you "drop into IDA's plugins/ folder"
-rather than as a `pip install`-able package. To let an MCP-connected agent
-`import <plugin>` via the `py_eval` tool, the server provides a generic
-sys.path injection mechanism — set `IDA_MCP_PLUGIN_PATHS` (or pass
-`--plugin-paths`) to a colon-separated list of plugin checkout roots.
+The server discovers plugins through three first-class paths. Each path
+imports a top-level `mcp_manifest.py` describing the plugin's MCP-facing
+tools (see §12 below for the manifest contract). All three paths are
+documented and supported public configuration knobs.
 
-What the server does at startup:
+**Path A — pip entry points.** Plugins shipped as Python distributions
+declare an entry point in their `pyproject.toml`:
 
-1. After idalib is initialized (`init_library` succeeded, `import idapro`
-   resolved), the bootstrap calls `_inject_plugin_paths()`.
-2. `IDA_MCP_PLUGIN_PATHS` is read from env / CLI flag. Empty / unset is a
-   strict no-op (no log, no warning, no `sys.path` change).
-3. The value is split on `:` (`PYTHONPATH`-style); empty tokens are
-   dropped. Each non-empty path is inserted at the **front** of
-   `sys.path`, in left-to-right order: writing
-   `IDA_MCP_PLUGIN_PATHS=/a:/b:/c` results in `sys.path[0..2] = [/a, /b, /c]`.
-4. Stdout shows one line per path:
-   `[plugin-paths] sys.path injected: <path> (exists: <bool>)`. If a path
-   does not exist, an additional `[plugin-paths] warning: <path> does not
-   exist` lands on stderr but the server still starts — general-purpose
-   IDA tools remain usable.
+```toml
+[project.entry-points."headless_ida_mcp.plugins"]
+your_plugin = "your_plugin.mcp_manifest"
+```
 
-**Invariant:** server startup never executes `import <plugin>`. IDA plugins
-typically have global side effects (register_action, hook installation,
-etc.); the first import is the agent's choice via `py_eval`, not the
-server's.
+`pip install`ing the distribution makes the plugin visible to every
+`headless_ida_mcp_server` process in the same Python environment.
 
-### Why front-insert?
+**Path B — directory scan.** The server scans two directory roots one
+level deep for any subdirectory containing `mcp_manifest.py`:
 
-`sys.path.insert(0, path)` ensures the user's plugin checkout shadows any
-stale pip-installed wheel of the same name — handy when developing a plugin
-locally while a wheel happens to be in your venv.
+1. `~/.idapro/plugins/*` — the conventional IDA plugins folder.
+2. Every non-empty path in `IDA_MCP_PLUGIN_PATHS` (colon-separated, same
+   parser as PYTHONPATH).
+
+`IDA_MCP_PLUGIN_PATHS` is **public, agent-visible configuration** — feel
+free to use it from CI / agent harnesses / documentation, including in
+end-user instructions. (Earlier guidance to "hide this env from
+end-users" is explicitly withdrawn.) The env retains its existing role
+of front-injecting each path onto `sys.path` for legacy `py_eval`
+imports; the manifest discovery and the `sys.path` injection share the
+same parser.
+
+When the same `PLUGIN.name` is discovered through both Path A and Path B,
+**Path A wins** and Path B is skipped with an INFO log naming both
+sources. Two manifests declaring the same `PLUGIN.name` (along the same
+path or across paths) abort startup with both source locations listed —
+this keeps plugin identity unambiguous.
+
+### Per-session enable / disable lifecycle
+
+The server registers four meta tools that drive the plugin lifecycle.
+They are tagged `kind:read` plus the sentinel `core::plugin-meta` and
+are immune to `--exclude-tags`:
+
+* `plugins()` — return one entry per loaded plugin (`name`,
+  `description`, `version`, `tool_count`, `enabled` per calling session).
+* `plugin_tools(name)` — peek the prefixed tool names + signatures
+  exposed by `<name>` without changing session state.
+* `enable_plugin(name)` — add the plugin to the calling session's
+  enabled set. Server emits `notifications/tools/list_changed` so the
+  client refetches `list_tools` and sees the plugin tools.
+* `disable_plugin(name)` — mirror operation, drops them again.
+
+Every fresh session starts with an **empty enabled set**. Plugin enable
+state is per-session and ephemeral — reconnects start over. The default
+`list_tools` surface is `built-in + 4 meta`; plugin tools become visible
+only after the session enables their parent plugin.
 
 ### Examples
 
-Single plugin:
+Single directory plugin (Path B):
 
 ```bash
-IDA_MCP_PLUGIN_PATHS=/path/to/your-plugin \
+IDA_MCP_PLUGIN_PATHS=/path/to/your-plugin-root \
   uvx --python 3.12 \
       --with /opt/ida-pro-9.3/idalib/python/idapro-*.whl \
       --from git+https://github.com/RainbowXie/headless-ida-mcp-server \
       headless_ida_mcp_server
 ```
 
+The path should contain subdirectories with `mcp_manifest.py`, e.g.
+`/path/to/your-plugin-root/your_plugin/mcp_manifest.py`. The root itself
+is also injected into `sys.path[0]` so legacy `py_eval` imports keep
+working.
+
 ```python
-# Agent-side pseudo-code:
-mcp.call_tool("py_eval", {"code": "from your_plugin import api; api.__file__"})
+# Agent-side flow:
+mcp.call_tool("plugins", {})                          # list loaded plugins
+mcp.call_tool("plugin_tools", {"name": "your_plugin"})# peek tools
+mcp.call_tool("enable_plugin", {"name": "your_plugin"})  # opt session in
+# list_tools now contains your_plugin__<short> entries; call them directly:
+mcp.call_tool("your_plugin__do_thing", {...})
 ```
 
-Multiple plugins (colon-separated; left = highest priority on `sys.path`):
+Multiple plugin roots (left-most wins on the `sys.path` side):
 
 ```bash
-IDA_MCP_PLUGIN_PATHS=/path/to/plugin-a:/path/to/HexRaysCodeXplorer \
-  uvx --python 3.12 \
-      --with /opt/ida-pro-9.3/idalib/python/idapro-*.whl \
-      --from git+https://github.com/RainbowXie/headless-ida-mcp-server \
-      headless_ida_mcp_server
+IDA_MCP_PLUGIN_PATHS=/path/to/plugin-a-root:/path/to/HexRaysCodeXplorer-root \
+  ...
 ```
 
-```python
-mcp.call_tool("py_eval", {"code": "import plugin_a; plugin_a.__file__"})
-mcp.call_tool("py_eval", {"code": "import HexRaysCodeXplorer"})
-```
+If the plugin is `pip install`-able with an entry point, you do not
+need `IDA_MCP_PLUGIN_PATHS` at all — `site-packages` is already on
+`sys.path` and Path A picks it up automatically.
 
-If the plugin is `pip install`-able, you don't need this mechanism at all —
-`site-packages` is already on `sys.path`, and `IDA_MCP_PLUGIN_PATHS` can stay
-unset.
+**Invariant:** discovery only **imports** manifests; it never invokes
+any handler. Plugin handlers must keep `import idaapi` / `ida_*`
+calls inside the handler body so discovery does not touch idalib state.
+
+### `IDA_MCP_PLUGIN_PATHS` vs `~/.idapro/plugins/`
+
+These are two distinct loading mechanisms with different lifetimes,
+visibility, and side effects. They are not mutually exclusive — they
+overlap, and a single plugin can live in either (or both).
+
+| Property | `IDA_MCP_PLUGIN_PATHS` | `~/.idapro/plugins/` |
+|---|---|---|
+| Trigger | Lazy: agent calls `enable_plugin(name)`. | Eager: IDA auto-loads at every process start (incl. `idalib`). |
+| Scope | Fork namespace; only `headless_ida_mcp_server` reads it. | IDA install global: every `idat` / `idalib` process. |
+| IDA event hooks | Cannot install IDA UI / event hooks (loaded too late, agent-driven). | Can install IDA UI / `idaapi.plugin_t` event hooks. |
+| Packaging | None required: any directory with `mcp_manifest.py`. | None required: any directory IDA recognises as a plugin. |
+| Per-session | Per session enable / disable via meta tools. | Loaded once per process; no per-session toggle. |
+| Output side effect | Quiet (manifest import is free of side effects). | Emits init / term lines on fd 1 — see §"stdio mode noise isolation". |
+
+`~/.idapro/plugins/` lines (e.g. `D-810 PK initialized (version 0.11)`,
+`[MCP] Plugin loaded, ...`) are exactly the third-party noise the
+fd-redirect from §"stdio mode noise isolation" pushes to stderr in
+stdio mode. The fork cannot suppress those prints at their source —
+they live outside this codebase — so the only lever is the redirect.
+If you want a fully quiet stdio session, prefer `IDA_MCP_PLUGIN_PATHS`
+(lazy / agent-driven / quiet at startup) over installing the same
+plugin into `~/.idapro/plugins/` (eager / global / chatty).
 
 ## 7. Tools and resources
 
-The server exposes **84 MCP tools + 11 MCP resources** (3 fork-only
-lifecycle tools + 81 vendored upstream tools + 11 vendored upstream
-resources):
+The server exposes **85 MCP tools + 11 MCP resources** (4 fork-only
+tools + 81 vendored upstream tools + 11 vendored upstream resources):
 
 | Group | Source | Examples |
 |---|---|---|
-| Lifecycle | fork-only | `set_binary_path`, `unset`, `py_eval` (call `unset` before re-`set_binary_path` to switch IDB) |
+| Lifecycle / undo | fork-only | `set_binary_path`, `unset`, `py_eval`, `undo` (call `unset` before re-`set_binary_path` to switch IDB; see §11 for the undo contract) |
 | Core / metadata | `ida_mcp/api_core.py` | `server_health`, `lookup_funcs`, `list_funcs`, `imports`, `idb_save`, `find_regex`, `search_text` |
 | Analysis | `ida_mcp/api_analysis.py` | `decompile`, `disasm`, `xrefs_to`, `callees`, `callgraph`, `find_bytes`, `basic_blocks` |
 | Memory | `ida_mcp/api_memory.py` | `get_bytes`, `get_int`, `get_string`, `get_global_value`, `patch`, `put_int` |
@@ -295,6 +395,17 @@ The `ida_mcp/` subpackage is vendored from upstream
 resynced ad-hoc as upstream evolves. `api_discovery.py` (process discovery /
 multi-instance plumbing) is intentionally NOT vendored — irrelevant under
 idalib.
+
+**Resync workflow.** Every time the vendored `ida_mcp/api_*.py` files are
+re-synced from upstream, maintainers MUST audit
+`src/headless_ida_mcp_server/tags.py`: any tool name added by upstream
+that is missing from `TOOL_TAGS` falls through to the conservative
+`kind:read` default and is reported on every server start as a
+`WARNING` log line `untagged tools default to kind:read: [...]`. Read
+that log line after each resync and either confirm the new tool really
+is read-only, or add the correct `kind:write` / `kind:unsafe` entry.
+Same rule applies when adding a new fork-only tool: the entry MUST land
+in `tags.py` in the same change as the tool itself.
 
 ### Debugger tools are best-effort
 
@@ -380,9 +491,273 @@ plugin APIs, walk the database, mutate state.
 | Tool call hangs | Almost always a `dbg_*` call expecting a debugger. Cancel and switch to static tools. |
 | `error: Decompilation failed` | The function isn't decompilable (no hex-rays decompiler for the arch, or the function is malformed). Check with `disasm` first. |
 
-## 11. See also
+## 11. Capability gating and undo
+
+The server classifies every registered tool with one of three capability
+tiers (`kind:read` / `kind:write` / `kind:unsafe`) so unattended
+deployments can shrink the exposed surface and so writes can be rolled
+back with a single `undo()` call. Tag data lives in
+`src/headless_ida_mcp_server/tags.py`; the wrapper layer in
+`server.py` consumes it.
+
+### The three tiers
+
+| Tier | Behaviour | Examples |
+|---|---|---|
+| `kind:read` | No IDB mutation. Wrapper does nothing extra. | `decompile`, `disasm`, `xrefs_to`, `list_funcs`, `survey_binary`, `undo`, all `dbg_*` |
+| `kind:write` | Mutates IDB metadata. Wrapper auto-creates an `ida_undo` undo point **before** the call so a subsequent `undo()` reverts it. | `rename`, `set_type`, `set_comments`, `define_func`, `idb_save`, `set_binary_path` |
+| `kind:unsafe` | Destructive / irreversible (closes IDB, rewrites raw bytes that may straddle instruction boundaries, runs arbitrary Python, modifies state outside the IDB). Wrapper does **NOT** create an undo point — `ida_undo` cannot recover this kind of mutation. | `unset`, `py_eval`, `patch`, `patch_asm`, `undefine` |
+
+Optional secondary tags (`core::*` / `ext::*`) form a group path:
+`core::analysis::decompile`, `core::debug::registers`,
+`core::lifecycle`, `ext::py_eval`. They exist purely so glob filters can
+target a coarse functional area; the wrapper ignores them.
+
+### `--exclude-tags` / `IDA_MCP_EXCLUDE_TAGS`
+
+Comma-separated `fnmatch` globs. Any tool whose tag list matches any
+glob is dropped from the registered MCP surface at server startup.
+Resources are filtered with the same predicate (the resource URI is fed
+into `tags_for` and defaults to `kind:read` when not enumerated).
+
+| Goal | Flag |
+|---|---|
+| Read-only batch analysis (no IDB mutation, no destructive tools) | `--exclude-tags 'kind:write,kind:unsafe'` |
+| Allow normal writes but block destructive tools | `--exclude-tags 'kind:unsafe'` |
+| Drop the entire `dbg_*` surface in deployments without a debugger | `--exclude-tags 'core::debug::*'` |
+
+CLI flag wins over env (same precedence as the other CLI flags). An
+explicit `--exclude-tags ""` writes an empty value to the env, which
+decodes back to "no filter" — the documented way to reset a filter set
+in the env from a wrapper script.
+
+```bash
+# Read-only mode: rename / set_type / patch / py_eval / unset / set_binary_path are NOT registered
+$ uvx headless-ida-mcp-server --exclude-tags 'kind:write,kind:unsafe'
+# server log:
+# registered 64 tools (21 excluded by tag filter), 11 resources (0 excluded)
+# (4 fork-only tools: set_binary_path, unset, py_eval, undo)
+```
+
+The startup log always reports both totals and excluded counts so an
+operator can sanity-check the resulting surface.
+
+### The `undo()` MCP tool
+
+`undo(steps: int = 1)` drives `ida_undo.perform_undo()` from agents.
+The tool is itself tagged `kind:read` (so it remains usable in
+read-only mode and so the wrapper does NOT recursively create undo
+points around the undo call itself).
+
+```python
+# After a wrong rename:
+mcp.call_tool("undo", {})
+# → {
+#     "label_before": "rename",
+#     "steps_requested": 1,
+#     "steps_executed": 1,
+#     "error": None,
+#   }
+
+# Walk back three writes:
+mcp.call_tool("undo", {"steps": 3})
+
+# More steps requested than the undo stack has:
+mcp.call_tool("undo", {"steps": 99})
+# → {"steps_executed": 5, "error": "perform_undo returned False (no more undo points?)"}
+```
+
+### Undo boundaries
+
+Each `kind:write` tool call becomes exactly one `ida_undo` group:
+the wrapper calls `ida_undo.create_undo_point(name, name)` before the
+call, IDA closes the previous group and opens a new one, and the
+business logic appends to the fresh group. Two consecutive write
+calls therefore occupy two distinct undo groups, and `undo(steps=1)`
+reverts only the most recent one.
+
+### Important: `kind:unsafe` has NO auto-undo
+
+`patch_asm`, `patch`, `undefine`, `py_eval`, and `unset` deliberately
+skip undo-point creation. Calling `undo()` after one of those will
+roll back to whatever undo point was current **before** the unsafe
+call — i.e. you may end up rolling back a previous *legitimate* write
+instead of the unsafe one. Treat the unsafe tier as one-way; in
+unattended deployments combine `--exclude-tags 'kind:unsafe'` with
+explicit human review for any destructive change.
+
+### Adding a fork-only tool
+
+When introducing a new fork-only MCP tool, add a matching entry in
+`tags.py` in the same change. Untagged fork-only tools default to
+`kind:read` (which is wrong for any writer), and the startup
+`untagged tools default to kind:read: [...]` warning will surface the
+gap on the next run.
+
+## 12. Plugin contract
+
+This section is for **plugin authors** writing an `mcp_manifest.py` that
+exposes typed MCP tools to agents.
+
+### Manifest shape
+
+```python
+# your_plugin/mcp_manifest.py
+from typing import Annotated, Optional
+
+
+def rename_function(
+    addr: Annotated[int, "Effective address of the function"],
+    new_name: str,
+) -> dict:
+    # Lazy IDA imports inside the handler body keep discovery cheap and
+    # let the manifest module import without idalib being bootstrapped.
+    import ida_funcs, ida_name
+
+    fn = ida_funcs.get_func(addr)
+    if fn is None:
+        from headless_ida_mcp_server.plugins import ToolError
+        raise ToolError(-1, f"no function at {addr:#x}")
+    if not ida_name.set_name(fn.start_ea, new_name):
+        from headless_ida_mcp_server.plugins import ToolError
+        raise ToolError(-2, "set_name failed")
+    return {"addr": fn.start_ea, "name": new_name}
+
+
+PLUGIN = {
+    "name": "your_plugin",          # ^[a-z][a-z0-9_]*$, length 1-32
+    "description": "Short summary",   # required, non-empty
+    "version": "1.0.0",                # required
+    "categories": ["analysis"],        # optional, informational
+}
+
+TOOLS = [
+    {
+        "name": "rename_function",          # short name only; server prefixes
+        "handler": rename_function,         # callable, sync or async
+        "description": "Rename one function",
+        "tags": ["kind:write"],             # exactly one kind:* required
+        "timeout": 15,                       # optional, seconds, default 30
+        # "params": {                        # optional manifest overrides:
+        #     "new_name": {"description": "Desired new name"},
+        # },
+        # "mcp": False,                      # hide from list_tools / plugin_tools
+    },
+]
+```
+
+The full prefixed tool name agents see is `<plugin>__<short>` —
+`your_plugin__rename_function` in the example above. Combined name
+length must be ≤ 64 characters; longer combinations abort startup.
+
+### Schema reflection
+
+The server reflects the handler's signature with `inspect.signature` and
+maps types to JSON Schema:
+
+| Python                                    | JSON Schema                                    |
+|-------------------------------------------|------------------------------------------------|
+| `int`                                     | `{"type": "integer"}`                         |
+| `float`                                   | `{"type": "number"}`                          |
+| `str`                                     | `{"type": "string"}`                          |
+| `bool`                                    | `{"type": "boolean"}`                         |
+| `list[T]`                                 | `{"type": "array", "items": <T>}`             |
+| `dict`, `dict[str, T]`                    | `{"type": "object"}`                          |
+| `Optional[T]` / `T \| None`               | as `T`, not required, default `null`          |
+| `Annotated[T, "doc"]`                     | as `T` with `description: "doc"`              |
+| no annotation                             | `{"type": "string"}` (conservative)           |
+
+The optional `params` block in a tool entry overrides reflected fields
+field-by-field. Declaring a parameter not present in the signature is a
+hard error caught at startup.
+
+### Capability tags
+
+Each tool entry MUST declare exactly one of:
+
+* `kind:read` — pure query; no IDB mutation.
+* `kind:write` — IDB mutation that `ida_undo.perform_undo()` can revert.
+  The wrapper auto-creates an undo point before invoking the handler so
+  a single `undo()` call rolls back the change.
+* `kind:unsafe` — destructive / unrecoverable. The wrapper does NOT
+  auto-create an undo point.
+
+Every plugin tool also gets an auto-injected `ext::<plugin>::<short>`
+tag so operators can drop a plugin / tool with `--exclude-tags
+'ext::<plugin>::*'`. Patterns like `ext::*` drop every plugin tool.
+A fully tag-excluded plugin reports `enable_plugin(name)` failures with
+the `not loaded (excluded by tag filter)` message.
+
+### Errors
+
+Handlers raise `headless_ida_mcp_server.plugins.ToolError(code, message)`
+to signal expected failures. The wrapper converts that into the string
+`error: <code>: <message>`. Any other exception type is caught, the
+traceback logged at ERROR level, and the call returns
+`error: <ExcType>: <message>`. The server stays up; subsequent calls
+are unaffected.
+
+### Timeouts
+
+`timeout` defaults to 30 seconds. Sync handlers run on a shared thread
+pool; async handlers are awaited under `asyncio.wait_for`. On expiry the
+wrapper returns `error: timeout`. The server cannot interrupt arbitrary
+IDA SDK calls cleanly, so the underlying thread / task is detached;
+plan handler implementations accordingly.
+
+### `mcp:false`
+
+Set `"mcp": False` on a tool entry to keep it dispatchable but hide it
+from `list_tools` / `plugin_tools` in every session. Useful for
+plugin-internal helpers a plugin wants to keep callable from agents that
+already know the name (or from another tool inside the same plugin).
+`enable_plugin` / `disable_plugin` do not affect `mcp:false` tools —
+they are always callable.
+
+### Meta tools agents use
+
+* `plugins()` — list loaded plugins with the per-session `enabled` flag.
+* `plugin_tools(name)` — peek the prefixed tool names + reflected
+  schemas. Side-effect-free.
+* `enable_plugin(name)` — opt this session into the plugin. Emits
+  `notifications/tools/list_changed`.
+* `disable_plugin(name)` — drop the plugin from this session. Emits
+  `notifications/tools/list_changed`.
+
+All four are immune to `--exclude-tags` so the agent always has a path
+to discover and enable plugins.
+
+### Worked example: `your_plugin/mcp_manifest.py`
+
+The example at the top of this section, plus the on-disk layout below,
+makes the plugin discoverable through Path B (filesystem):
+
+```
+~/.idapro/plugins/
+└── your_plugin/
+    ├── mcp_manifest.py    # the manifest above
+    └── your_plugin/        # ordinary Python package
+        ├── __init__.py
+        └── api.py
+```
+
+Or, for `pip install`-able plugins, declare the entry point in
+`pyproject.toml`:
+
+```toml
+[project.entry-points."headless_ida_mcp.plugins"]
+your_plugin = "your_plugin.mcp_manifest"
+```
+
+Either way, `plugins()` will list `your_plugin` after the next server
+start; agents call `enable_plugin("your_plugin")` and the prefixed tool
+`your_plugin__rename_function` becomes callable from that session.
+
+## 13. See also
 
 - [README.md](../README.md) — short project overview, 5-line quickstart
 - [README_CN.md](../README_CN.md) — Chinese version of the project overview
 - [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) — upstream
   source of the 81 vendored tools and 11 resources
+- [`RamuneIDA/Ramune-ida`](https://github.com/RamuneIDA/Ramune-ida) — origin of
+  the three-tier `kind:*` capability tag scheme this fork ports
