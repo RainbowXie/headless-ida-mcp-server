@@ -47,6 +47,3 @@ Server 起来，IDB 加载，工具暴露。任意 MCP client 接上即可分析
 ## 贡献
 
 clone、`uv sync`、按 [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) 的贡献者流程走。PR 落 `v2`；`main` 是稳定 promote 目标。
-
-![](./images/pic.png)
-![](./images/pic2.png)

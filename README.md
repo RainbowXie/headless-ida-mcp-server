@@ -47,6 +47,3 @@ Server up, IDB loaded, tools exposed. Connect any MCP client.
 ## Contributing
 
 Clone, `uv sync`, follow the contributor flow in [`docs/agent-quickstart.md`](./docs/agent-quickstart.md). PRs land on `v2`; `main` is the stable promotion target.
-
-![](./images/pic.png)
-![](./images/pic2.png)
