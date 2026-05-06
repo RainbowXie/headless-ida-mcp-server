@@ -537,6 +537,25 @@ Fork 的 plugin contract 说 plugin enable 状态是 per-session 的。但 plugi
 
 这不是 bug，是当前 contract 的 inherent 行为 —— fork in-process 一份 plugin module 一份全局 state，无法做 per-session 状态隔离。如果 plugin 跟 IDA 一样是单 IDB 单进程的，问题不大；要做 multi-tenant 必须重新设计。
 
+## 跟着 worked example 走
+
+如果上面 7 步的描述还嫌抽象，看 [`headless-ida-mcp-comment-helper`](https://github.com/RainbowXie/headless-ida-mcp-comment-helper) —— 完整 reference plugin，仓库本身就是这套契约的 "把目录布局 + handler 实现 + manifest 写法照抄就能用" 的活样本。
+
+里面照着上面的拆分给出了：
+
+- `pyproject.toml` 含 `[project.entry-points."headless_ida_mcp.plugins"]`（Path A 装机即注册）
+- `comment_helper/api.py` —— 4 个 typed function，每个参数都标 `Annotated[T, "..."]`，`ida_*` import 全部 lazy 在函数体内（Step 6 的硬性要求）
+- `comment_helper/mcp_manifest.py` —— PLUGIN 块 + TOOLS 列表，手写 `description` / `tags` / `timeout`，没有任何 IDA-only top-level import
+- `tests/test_manifest.py` —— 5 条 IDA-free 校验（顶层无 `ida_*` 泄漏、PLUGIN 字段齐、4 个 tool、三种 kind tag 都覆盖、handler 都 callable、版本一致），跟本指南里说的 manifest schema 校验完全对得上
+- 三种 capability tier 的具体 handler：
+  - `find_comments` / `list_my_comments` 是 `kind:read` + `timeout=60`
+  - `add_comment` 是 `kind:write`（fork 自动包 `ida_undo` undo point）
+  - `clear_all_my_comments` 是 `kind:unsafe`（IDA undo 不能整批 comment 复原，所以**故意**不做 auto-undo，tool description 里把这点显式告诉 agent）
+- 错误模型示范：handler `raise ToolError(-2, "...")`，wrapper 自动转 `error: -2: ...` 字符串
+- README 给了 Path A (`pip install -e .`) 与 Path B (`IDA_MCP_PLUGIN_PATHS`) 两条接入路径 + agent 视角的全链路调用示例（discovery → peek → enable → call → disable）
+
+把 comment-helper 仓库 clone 下来跟这份指南 7 步**逐节对照**着读，能很快搞清"哪一段对应哪一节、为什么要这么写"。改造自己的 plugin 时直接 fork 这个目录骨架、改包名 + 改 handler 内容是最快的起步方式。
+
 ## 验证流程串成一条线
 
 最后给一份完整的 sanity check 顺序，照着一步步跑。

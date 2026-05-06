@@ -56,6 +56,12 @@
   形态，7 步具体改造路径 + 代码模板 + 常见陷阱 + 已知限制（Qt
   headless / debugpy / IDA 主线程要求）。契约本身的 spec
   reference 在 [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) §12。
+
+  **完整工作样例**：见
+  [`headless-ida-mcp-comment-helper`](https://github.com/RainbowXie/headless-ida-mcp-comment-helper)
+  —— 完整 reference plugin，`pip install` 完用 MCP client 直接驱动。
+  覆盖给函数 / 指令读 / 列 / 写 / 批量清 `[mcp]` 标记 comment 的 4 个
+  tool，三种 capability tier（read / write / unsafe）一应俱全。
 - **为 agent 自动化工作流打造**。专为 **unattended / 长跑 / 批量分析**
   优化：**不走 MCP elicitation**（server 永远不会中途打断 agent 找真人
   确认），没有前台/后台询问、没有确认对话框。失败统一返回

@@ -59,6 +59,13 @@ interactive plugin.
   templates, common pitfalls, and known limitations (Qt headless, debugpy,
   IDA main-thread). Contract reference is in
   [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) §12.
+
+  **Worked example**: see
+  [`headless-ida-mcp-comment-helper`](https://github.com/RainbowXie/headless-ida-mcp-comment-helper)
+  — a complete reference plugin you can `pip install` and drive from any
+  MCP agent. Reads / lists / writes / bulk-clears `[mcp]`-marked comments
+  on functions and instructions. Demonstrates all three capability tiers
+  (read / write / unsafe) and the typed-facade pattern.
 - **Built for autonomous agent workflows.** Optimized for unattended,
   long-running, batch analysis: no MCP elicitation (server never
   interrupts the agent to ask a human), no foreground / background
