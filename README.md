@@ -51,6 +51,14 @@ interactive plugin.
   `notifications/tools/list_changed` so the client refetches `list_tools`).
   For ad-hoc Python or plugins without a manifest, `IDA_MCP_PLUGIN_PATHS`
   still injects `sys.path[0]` and `py_eval` still works.
+
+  **Adapting an existing IDA plugin?** See
+  [`docs/plugin-adaptation-guide.md`](./docs/plugin-adaptation-guide.md) —
+  detailed walk-through of restructuring a reactive GUI plugin into a
+  manifest-conformant agent-callable form, with 7 concrete steps, code
+  templates, common pitfalls, and known limitations (Qt headless, debugpy,
+  IDA main-thread). Contract reference is in
+  [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) §12.
 - **Built for autonomous agent workflows.** Optimized for unattended,
   long-running, batch analysis: no MCP elicitation (server never
   interrupts the agent to ask a human), no foreground / background

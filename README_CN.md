@@ -49,6 +49,13 @@
   `notifications/tools/list_changed`，client 重新拉 `list_tools`）。
   无 manifest 的纯 Python plugin 仍可走 `IDA_MCP_PLUGIN_PATHS`
   + `py_eval`。
+
+  **要把一个现存的 IDA plugin 接到这套契约**？看
+  [`docs/plugin-adaptation-guide.md`](./docs/plugin-adaptation-guide.md)
+  —— 详细讲反应式 GUI plugin 怎么改造成 manifest-conformant
+  形态，7 步具体改造路径 + 代码模板 + 常见陷阱 + 已知限制（Qt
+  headless / debugpy / IDA 主线程要求）。契约本身的 spec
+  reference 在 [`docs/agent-quickstart.md`](./docs/agent-quickstart.md) §12。
 - **为 agent 自动化工作流打造**。专为 **unattended / 长跑 / 批量分析**
   优化：**不走 MCP elicitation**（server 永远不会中途打断 agent 找真人
   确认），没有前台/后台询问、没有确认对话框。失败统一返回
