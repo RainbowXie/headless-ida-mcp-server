@@ -22,3 +22,6 @@ exploit.py
 *.id2
 *.nam
 *.til
+.gitnexus
+AGENTS.md
+.claude/skills/gitnexus/
