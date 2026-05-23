@@ -13,6 +13,7 @@ Subsequent sessions find a warm daemon already running.
 import asyncio
 import os
 import subprocess
+import sys
 from typing import Any, Sequence
 
 from mcp import ClientSession
