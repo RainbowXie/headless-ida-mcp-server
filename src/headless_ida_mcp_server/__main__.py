@@ -70,7 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transport",
         dest="transport",
         default=None,
-        choices=["sse", "stdio"],
+        choices=["sse", "stdio", "streamable-http"],
         help="MCP transport mode (env: TRANSPORT). Default: sse.",
     )
     parser.add_argument(
