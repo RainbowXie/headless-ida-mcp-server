@@ -17,7 +17,8 @@ import sys
 from typing import Any, Sequence
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+# 使用 MCP SDK 标准导出的 streamable_http_client（带下划线）作为客户端传输层
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from mcp.server.lowlevel.server import NotificationOptions
@@ -60,7 +61,7 @@ async def _probe_daemon() -> bool:
 
 
 async def _fetch_real_tools() -> list[MCPTool]:
-    async with streamablehttp_client(DAEMON_URL) as (read_stream, write_stream, _):
+    async with streamable_http_client(DAEMON_URL) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -144,7 +145,7 @@ class HeadlessIdaStub(FastMCP):
             status = await self._activate_daemon()
             return [TextContent(type="text", text=status)]
 
-        async with streamablehttp_client(DAEMON_URL) as (read, write, _):
+        async with streamable_http_client(DAEMON_URL) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(name, arguments)
