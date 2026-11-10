@@ -473,14 +473,15 @@ async def test_concurrent_session_stubs_stay_isolated(tmp_path):
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                # The bootstrap tool description carries this stub's port, which
-                # is the only endpoint the client can observe.
-                listing = await session.list_tools()
-                bootstrap = next(t for t in listing.tools if t.name == "start_daemon")
-                port = int(re.search(r"port (\d+)", bootstrap.description or "").group(1))
                 assert (await session.call_tool("start_daemon", {})).content[0].text == (
                     "started"
                 )
+                # Read the port AFTER activation: a collision during start_daemon
+                # moves the stub to a new port, and the pre-activation tool
+                # description would then name the port it abandoned.
+                listing = await session.list_tools()
+                bootstrap = next(t for t in listing.tools if t.name == "start_daemon")
+                port = int(re.search(r"port (\d+)", bootstrap.description or "").group(1))
                 await session.call_tool("set_binary_path", {"path": str(binary)})
                 health = json.loads(
                     (await session.call_tool("server_health", {})).content[0].text
