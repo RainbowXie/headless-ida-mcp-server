@@ -8,11 +8,12 @@ Headless 跑 IDA Pro，让任意 MCP agent 驱动它。
 
 ## 是什么
 
-进程内 `idalib` SDK 跑 IDA 后端，FastMCP 把它暴露成 **85 个 MCP tool + 11 个 resource**，第三方 plugin 通过 [`mcp_manifest.py`](./docs/plugin-adaptation-guide.md) 热挂载，capability tag 自动 undo，`instructions` primer 在 client 连上时推过去。专为 unattended 批量 agent 工作流，不是给交互式插件用的。
+进程内 `idalib` SDK 跑 IDA 后端，FastMCP 把它暴露成 **90 个 MCP tool + 11 个 resource**，第三方 plugin 通过 [`mcp_manifest.py`](./docs/plugin-adaptation-guide.md) 热挂载，capability tag 自动 undo，`instructions` primer 在 client 连上时推过去。专为 unattended 批量 agent 工作流，不是给交互式插件用的。
 
 ## 特性
 
-- **完整工具面** —— 分析（`decompile` / `disasm` / `xrefs_to` / `callgraph` / ...）、memory、types、structures、modify、stack、search、sigmaker、debugger 各类。81 个 vendored from upstream + 4 个 fork-only（`set_binary_path` / `unset` / `py_eval` / `undo`）。随上游按需 resync。
+- **完整工具面** —— 分析（`decompile` / `disasm` / `xrefs_to` / `callgraph` / ...）、memory、types、structures、modify、stack、search、sigmaker、debugger 各类。81 个 vendored from upstream + 5 个 fork-only（`set_binary_path` / `unset` / `analysis_status` / `py_eval` / `undo`）+ 4 个 session meta tool。随上游按需 resync。
+- **非阻塞打开** —— `set_binary_path(path, wait=False)` 打开 IDB 即返回，IDA 自动分析在后台推进（`analysis_status(wait_sec=...)` 报 `running` / `done`、函数数与队列状态）。7 MB 的库以前要阻塞 78 s，现在 1.5 s 返回；需要旧行为就传 `wait=True`。
 - **进程内 idalib** —— 没有 `idat` subprocess，没有 per-call spawn 开销。一次 MCP 连接驱动一整段 agent session 跑同一个 IDB，写入走 `idb_save` 持久化。
 - **Plugin 通过 `mcp_manifest.py` 暴露强类型 MCP tool** —— 在你的 plugin 源码旁边放一个 manifest，server 反射每个 handler 成 typed MCP tool，自动接 capability tag、auto-undo、per-tool timeout。三条发现路径：pip entry point、`~/.idapro/plugins/`、`IDA_MCP_PLUGIN_PATHS`。要把现存 IDA plugin 接进来，看 [`docs/plugin-adaptation-guide.md`](./docs/plugin-adaptation-guide.md)。**完整工作样例**：见 [`headless-ida-mcp-comment-helper`](https://github.com/RainbowXie/headless-ida-mcp-comment-helper) —— 完整 reference plugin，`pip install` 完用 MCP client 直接驱动。覆盖给函数 / 指令读 / 列 / 写 / 批量清 `[mcp]` 标记 comment 的 4 个 tool，三种 capability tier（read / write / unsafe）一应俱全。
 - **能力分级 + 自动 undo** —— 每个 tool 标 `kind:read` / `kind:write` / `kind:unsafe`。`kind:write` 自动建 `ida_undo` undo point，agent 写错一次 `undo()` 就回滚。运维方用 `--exclude-tags 'kind:write,kind:unsafe'` 跑严格只读批量分析。
