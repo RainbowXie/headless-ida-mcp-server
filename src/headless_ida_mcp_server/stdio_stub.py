@@ -4,7 +4,9 @@
 Always responsive (CC spawns via stdio).  Starts with a single ``start_daemon``
 tool.  The agent calls it to explicitly bring up the daemon; once connected,
 ``send_tool_list_changed()`` notifies CC to re-fetch, and the full real tool
-surface is transparently proxied thereafter.
+surface is transparently proxied thereafter.  ``start_daemon`` stays advertised
+alongside that surface: it is the only recovery path when the daemon dies
+mid-session, and a client only re-fetches the tool list on the notification.
 
 Two operating modes:
 
@@ -91,6 +93,20 @@ def _find_free_port(host: str = DEFAULT_HOST) -> int:
         return int(sock.getsockname()[1])
 
 
+def _start_daemon_tool(port: int) -> MCPTool:
+    """Bootstrap / recovery tool advertised before and after activation."""
+    return MCPTool(
+        name="start_daemon",
+        description=(
+            f"Start the headless-ida daemon with streamable-http on port {port}. "
+            "Call this once before using any other headless IDA tools, and "
+            "again if a tool reports the daemon is unreachable. Returns "
+            "'started' if newly spawned, 'running' if already up."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+
 def _resolve_endpoint(args: argparse.Namespace) -> tuple[str, int]:
     """Map parsed CLI args to the concrete (host, port) daemon endpoint."""
     # The ephemeral port is fixed at startup (not at first tool call) so the
@@ -119,7 +135,6 @@ class HeadlessIdaStub(FastMCP):
         self._session_mode = session_mode
         self._real_tools: list[MCPTool] | None = None
         self._daemon_proc: subprocess.Popen | None = None
-        self._daemon_ready = False
         self._startup_lock = asyncio.Lock()
         # atexit covers interpreter exits that bypass run_stdio_async's
         # finally (fatal errors inside FastMCP); signal-driven exits are
@@ -212,32 +227,51 @@ class HeadlessIdaStub(FastMCP):
                 result = await session.list_tools()
                 return list(result.tools)
 
+    def _forget_daemon(self) -> None:
+        """Drop the cached tool surface of a daemon we can no longer reach.
+
+        ``_real_tools`` is a snapshot taken from a daemon that was alive at the
+        time; keeping it across a failed probe or forward kept the agent calling
+        tools on a port nobody listens to. Liveness itself is never cached —
+        ``_probe_daemon`` is the only source of truth.
+        """
+        self._real_tools = None
+
+    async def _adopt_daemon(self, status: str) -> str:
+        """Adopt a reachable daemon: cache its tool surface, tell CC to re-list."""
+        if self._real_tools is None:
+            self._real_tools = await self._fetch_real_tools()
+        await self._notify_tools_changed()
+        return status
+
     async def _activate_daemon(self) -> str:
         """Start or probe the daemon; fetch real tools; notify CC to re-list."""
-        if self._daemon_ready or await self._probe_daemon():
-            self._daemon_ready = True
-            if self._real_tools is None:
-                self._real_tools = await self._fetch_real_tools()
-            await self._notify_tools_changed()
-            return "running"
-
-        async with self._startup_lock:
-            if self._daemon_ready or await self._probe_daemon():
-                self._daemon_ready = True
-                if self._real_tools is None:
-                    self._real_tools = await self._fetch_real_tools()
-                await self._notify_tools_changed()
-                return "running"
-
-            self._spawn_daemon()
-            for _ in range(120):
-                await asyncio.sleep(1)
+        try:
+            async with self._startup_lock:
+                # Probe unconditionally: an answered TCP connect is the only
+                # liveness evidence we accept. Caching it is what let a crashed
+                # daemon keep reporting "running" while every forwarded call
+                # failed against a closed port.
                 if await self._probe_daemon():
-                    self._daemon_ready = True
-                    self._real_tools = await self._fetch_real_tools()
-                    await self._notify_tools_changed()
-                    return "started"
-            return "error: daemon failed to start within 120 s"
+                    return await self._adopt_daemon("running")
+
+                # Forget the surface of the daemon we just failed to reach, and
+                # reap a session-mode child that is still holding the port, so
+                # the replacement can bind it.
+                self._forget_daemon()
+                self._terminate_tracked_daemon()
+                self._spawn_daemon()
+                for _ in range(120):
+                    await asyncio.sleep(1)
+                    if await self._probe_daemon():
+                        return await self._adopt_daemon("started")
+                return "error: daemon failed to start within 120 s"
+        except Exception as exc:
+            # Spawn / MCP handshake failures (port stolen by a non-MCP
+            # listener, idalib bootstrap crash, ...) must not escape as an
+            # anyio ExceptionGroup: the client treats that as a dead server.
+            self._forget_daemon()
+            return f"error: daemon startup failed: {type(exc).__name__}: {exc}"
 
     async def _notify_tools_changed(self) -> None:
         try:
@@ -251,20 +285,14 @@ class HeadlessIdaStub(FastMCP):
                 pass
 
     async def list_tools(self) -> list[MCPTool]:
-        if self._real_tools is None:
-            return [
-                MCPTool(
-                    name="start_daemon",
-                    description=(
-                        f"Start the headless-ida daemon with streamable-http "
-                        f"on port {self._port}. Call this once before using "
-                        f"any other headless IDA tools. Returns 'started' if "
-                        f"newly spawned, 'running' if already up."
-                    ),
-                    inputSchema={"type": "object", "properties": {}},
-                )
-            ]
-        return list(self._real_tools)
+        # ``start_daemon`` stays in the surface after activation on purpose:
+        # it is the recovery path ``call_tool`` points at when the daemon dies,
+        # and the client snapshots this list until the next list-changed
+        # notification, so dropping it would make that advice uncallable.
+        tools = [_start_daemon_tool(self._port)]
+        if self._real_tools is not None:
+            tools.extend(self._real_tools)
+        return tools
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
@@ -273,11 +301,29 @@ class HeadlessIdaStub(FastMCP):
             status = await self._activate_daemon()
             return [TextContent(type="text", text=status)]
 
-        async with streamable_http_client(self._daemon_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(name, arguments)
-                return result.content
+        try:
+            async with streamable_http_client(self._daemon_url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(name, arguments)
+                    return result.content
+        except Exception as exc:
+            # A dead daemon reaches this point as an anyio ExceptionGroup from
+            # the transport's TaskGroup. Leaking it into the MCP transport makes
+            # the downstream client treat the stub itself as broken and discard
+            # the tool surface; return the repo-standard ``error:`` text and
+            # forget the dead daemon so the next ``start_daemon`` respawns it.
+            self._forget_daemon()
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"error: daemon unreachable at {self._daemon_url} "
+                        f"({type(exc).__name__}: {exc}); call start_daemon to "
+                        "restart it"
+                    ),
+                )
+            ]
 
 
 def main() -> None:
