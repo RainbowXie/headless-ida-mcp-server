@@ -12,6 +12,7 @@
 
 """Core API Functions - IDB metadata and basic queries"""
 
+import os
 import re
 import time
 from typing import Annotated, Any, NotRequired, TypedDict
@@ -64,6 +65,9 @@ class ServerHealthResult(TypedDict):
     hexrays_ready: bool
     strings_cache_ready: bool
     strings_cache_size: int
+    # Echo of IDA_MCP_SESSION_TOKEN. The stdio stub uses it to prove that the
+    # daemon on its port belongs to this session; null when started without one.
+    session_token: str | None
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -351,6 +355,19 @@ def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]
     return projected
 
 
+def _idb_attr(fn, default=None):
+    """Read an IDB attribute, or ``default`` when no database is open.
+
+    The health probe is deliberately callable before an IDB exists (a client
+    needs it to discover that no binary is loaded), and the IDA SDK raises on
+    several of these getters without one.
+    """
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 def _build_health_payload() -> dict:
     auto_is_ok = getattr(ida_auto, "auto_is_ok", None)
     auto_analysis_ready = bool(auto_is_ok()) if callable(auto_is_ok) else None
@@ -361,23 +378,20 @@ def _build_health_payload() -> dict:
     except Exception:
         hexrays_ready = False
 
-    idb_path = None
-    try:
-        idb_path = idc.get_idb_path()
-    except Exception:
-        idb_path = None
+    idb_path = _idb_attr(idc.get_idb_path) or None
 
     return {
         "status": "ok",
         "uptime_sec": round(time.time() - _server_started_at, 3),
         "idb_path": idb_path,
-        "module": ida_nalt.get_root_filename(),
-        "input_path": ida_nalt.get_input_file_path(),
-        "imagebase": hex(idaapi.get_imagebase()),
+        "module": _idb_attr(ida_nalt.get_root_filename, ""),
+        "input_path": _idb_attr(ida_nalt.get_input_file_path, ""),
+        "imagebase": hex(_idb_attr(idaapi.get_imagebase, 0)),
         "auto_analysis_ready": auto_analysis_ready,
         "hexrays_ready": hexrays_ready,
         "strings_cache_ready": _strings_cache is not None,
         "strings_cache_size": len(_strings_cache) if _strings_cache is not None else 0,
+        "session_token": os.environ.get("IDA_MCP_SESSION_TOKEN") or None,
     }
 
 

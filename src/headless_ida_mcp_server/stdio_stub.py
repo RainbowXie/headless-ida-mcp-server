@@ -21,7 +21,9 @@ Two operating modes:
 import argparse
 import asyncio
 import atexit
+import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -51,6 +53,33 @@ _DAEMON_TERMINATE_TIMEOUT = 5
 # never hang on a daemon that accepts the connection but does not answer
 # the MCP handshake (e.g. a foreign process holding the port).
 _TOOL_FETCH_TIMEOUT = 5
+
+# A session-mode stub that lands on a port owned by another session retries on
+# a fresh port. Three attempts absorbs a burst of simultaneous startups while
+# still failing loudly instead of looping forever.
+_MAX_PORT_ATTEMPTS = 3
+
+# Startup budget for a spawned daemon that is alive but never becomes ready.
+_DAEMON_START_TIMEOUT_SEC = 120
+
+
+def _session_token_of(result: Any) -> "str | None":
+    """Extract ``session_token`` from a ``server_health`` tool result.
+
+    The tool returns a JSON text block (structured output is disabled for the
+    vendored tools), so the payload has to be decoded here.
+    """
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload.get("session_token")
+    return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -138,6 +167,10 @@ class HeadlessIdaStub(FastMCP):
         # session_mode ties the spawned daemon to this stub's lifetime; in
         # default mode the daemon detaches and must outlive the stub.
         self._session_mode = session_mode
+        # Identity marker for session mode: the daemon echoes it through
+        # `server_health`, so this stub can tell its own daemon from one that
+        # another session happened to bind on the same port first.
+        self._session_token = secrets.token_hex(16) if session_mode else None
         self._real_tools: list[MCPTool] | None = None
         self._daemon_proc: subprocess.Popen | None = None
         self._startup_lock = asyncio.Lock()
@@ -163,15 +196,18 @@ class HeadlessIdaStub(FastMCP):
             self._terminate_tracked_daemon()
 
     def _spawn_daemon(self) -> subprocess.Popen:
+        env = {
+            **os.environ,
+            "IDA_INSTALL_DIR": os.environ.get("IDA_INSTALL_DIR", "/opt/ida-pro-9.3"),
+            "TRANSPORT": "streamable-http",
+            "PORT": str(self._port),
+            "HOST": self._host,
+        }
+        if self._session_token is not None:
+            env["IDA_MCP_SESSION_TOKEN"] = self._session_token
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "headless_ida_mcp_server"],
-            env={
-                **os.environ,
-                "IDA_INSTALL_DIR": os.environ.get("IDA_INSTALL_DIR", "/opt/ida-pro-9.3"),
-                "TRANSPORT": "streamable-http",
-                "PORT": str(self._port),
-                "HOST": self._host,
-            },
+            env=env,
             # start_new_session=True detaches the daemon so it stays warm
             # across stub sessions (historical behavior); session mode keeps
             # the child in this process group and reaps it via
@@ -225,12 +261,41 @@ class HeadlessIdaStub(FastMCP):
         except Exception:
             return False
 
-    async def _fetch_real_tools(self) -> list[MCPTool]:
-        async with streamable_http_client(self._daemon_url) as (read_stream, write_stream, _):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return list(result.tools)
+    async def _handshake(self) -> tuple[str, list[MCPTool] | None]:
+        """Classify the configured endpoint and, when it is ours, fetch its tools.
+
+        Returns ``(identity, tools)`` where identity is one of:
+
+        * ``absent`` — nothing accepts a connection on the port;
+        * ``foreign`` — something answers but must not be driven: either it
+          fails the MCP handshake (a non-MCP process holds the port), or it
+          reports a session token that is not ours;
+        * ``ours`` — a headless-ida daemon carrying our token, or any
+          headless-ida daemon when this stub expects no token (default mode).
+
+        One MCP session serves both the identity check and the tool fetch, so
+        adoption costs a single connection.
+        """
+        if not await self._probe_daemon():
+            return "absent", None
+        try:
+            async with asyncio.timeout(_TOOL_FETCH_TIMEOUT):
+                async with streamable_http_client(self._daemon_url) as (
+                    read_stream,
+                    write_stream,
+                    _,
+                ):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        tools = list((await session.list_tools()).tools)
+                        health = await session.call_tool("server_health", {})
+        except Exception:
+            # Connection accepted, but nothing MCP-shaped answered behind it.
+            return "foreign", None
+
+        if self._session_token is not None and _session_token_of(health) != self._session_token:
+            return "foreign", None
+        return "ours", tools
 
     def _forget_daemon(self) -> None:
         """Drop the cached tool surface of a daemon we can no longer reach.
@@ -238,39 +303,95 @@ class HeadlessIdaStub(FastMCP):
         ``_real_tools`` is a snapshot taken from a daemon that was alive at the
         time; keeping it across a failed probe or forward kept the agent calling
         tools on a port nobody listens to. Liveness itself is never cached —
-        ``_probe_daemon`` is the only source of truth.
+        ``_handshake`` is the only source of truth.
         """
         self._real_tools = None
 
-    async def _adopt_daemon(self, status: str) -> str:
-        """Adopt a reachable daemon: cache its tool surface, tell CC to re-list."""
-        if self._real_tools is None:
-            self._real_tools = await self._fetch_real_tools()
-        await self._notify_tools_changed()
-        return status
+    def _reallocate_port(self) -> None:
+        """Move to a fresh ephemeral port after a collision.
+
+        Only session mode owns its port. Default mode targets the endpoint from
+        the client config and must not silently move away from it.
+        """
+        self._port = _find_free_port(self._host)
+        self._daemon_url = f"http://{self._host}:{self._port}/mcp"
+
+    async def _await_daemon_start(self) -> str:
+        """Wait for the child just spawned: ``ready`` / ``foreign`` / ``exited`` / ``timeout``."""
+        for _ in range(_DAEMON_START_TIMEOUT_SEC):
+            await asyncio.sleep(1)
+            proc = self._daemon_proc
+            if proc is not None and proc.poll() is not None:
+                return "exited"
+            identity, tools = await self._handshake()
+            if identity == "ours":
+                self._real_tools = tools
+                return "ready"
+            # A detached daemon (default mode) is untracked, so a foreign answer
+            # is conclusive. A tracked child that is still alive may simply not
+            # be serving yet — uvicorn binds before the app is ready — so keep
+            # waiting instead of reallocating away from our own daemon.
+            if identity == "foreign" and proc is None:
+                return "foreign"
+        return "timeout"
+
+    async def _spawn_with_recovery(self) -> str:
+        """Spawn, wait, and retry on a new port when session mode collides."""
+        attempts = _MAX_PORT_ATTEMPTS if self._session_mode else 1
+        last = ""
+        for attempt in range(attempts):
+            if attempt:
+                # The previous attempt lost its port; move before spawning again
+                # so the error message and the live endpoint stay in sync.
+                self._reallocate_port()
+            self._forget_daemon()
+            self._terminate_tracked_daemon()
+            self._spawn_daemon()
+            outcome = await self._await_daemon_start()
+            if outcome == "ready":
+                await self._notify_tools_changed()
+                return "started"
+            if outcome == "exited":
+                proc = self._daemon_proc
+                code = proc.poll() if proc is not None else None
+                last = f"daemon on port {self._port} exited during startup (code {code})"
+            elif outcome == "foreign":
+                last = f"port {self._port} is served by another process"
+            else:
+                last = (
+                    f"daemon on port {self._port} was not ready within "
+                    f"{_DAEMON_START_TIMEOUT_SEC} s"
+                )
+            if not self._session_mode:
+                return f"error: {last}"
+        return (
+            f"error: session port collision after {attempts} attempts ({last}); "
+            "no daemon was adopted"
+        )
 
     async def _activate_daemon(self) -> str:
-        """Start or probe the daemon; fetch real tools; notify CC to re-list."""
+        """Start or adopt the daemon; fetch real tools; notify CC to re-list."""
         try:
             async with self._startup_lock:
-                # Probe unconditionally: an answered TCP connect is the only
-                # liveness evidence we accept. Caching it is what let a crashed
-                # daemon keep reporting "running" while every forwarded call
-                # failed against a closed port.
-                if await self._probe_daemon():
-                    return await self._adopt_daemon("running")
-
-                # Forget the surface of the daemon we just failed to reach, and
-                # reap a session-mode child that is still holding the port, so
-                # the replacement can bind it.
-                self._forget_daemon()
-                self._terminate_tracked_daemon()
-                self._spawn_daemon()
-                for _ in range(120):
-                    await asyncio.sleep(1)
-                    if await self._probe_daemon():
-                        return await self._adopt_daemon("started")
-                return "error: daemon failed to start within 120 s"
+                # Handshake unconditionally: an answered TCP connect says
+                # nothing about *whose* daemon answered. Caching liveness is
+                # what let a crashed daemon report "running" forever, and a
+                # bare probe is what let a foreign daemon be adopted.
+                identity, tools = await self._handshake()
+                if identity == "ours":
+                    self._real_tools = tools
+                    await self._notify_tools_changed()
+                    return "running"
+                if identity == "foreign":
+                    if not self._session_mode:
+                        return (
+                            f"error: {self._daemon_url} is served by another "
+                            "process; refusing to adopt it"
+                        )
+                    # Another session grabbed the port we were handed: move on
+                    # before spawning, otherwise our child could not bind.
+                    self._reallocate_port()
+                return await self._spawn_with_recovery()
         except Exception as exc:
             # Spawn / MCP handshake failures (port stolen by a non-MCP
             # listener, idalib bootstrap crash, ...) must not escape as an
@@ -295,19 +416,15 @@ class HeadlessIdaStub(FastMCP):
         A client only re-fetches the tool list on
         ``notifications/tools/list_changed``, so relying on activation alone
         leaves a restarted stub advertising the bootstrap tool until the agent
-        notices. Probing here makes the first listing complete whenever a warm
-        daemon is up.
+        notices. Handshaking here makes the first listing complete whenever a
+        warm daemon of ours is up.
         """
-        if not await self._probe_daemon():
-            return
-        try:
-            self._real_tools = await asyncio.wait_for(
-                self._fetch_real_tools(), timeout=_TOOL_FETCH_TIMEOUT
-            )
-        except Exception:
-            # Unreachable handshake or a timeout: keep the bootstrap-only
-            # surface rather than advertising tools we cannot serve.
-            self._real_tools = None
+        identity, tools = await self._handshake()
+        # `absent` and `foreign` both leave the bootstrap-only surface: a
+        # listing must never spawn a daemon, and must never adopt one that
+        # belongs to another session.
+        if identity == "ours":
+            self._real_tools = tools
 
     async def list_tools(self) -> list[MCPTool]:
         if self._real_tools is None:

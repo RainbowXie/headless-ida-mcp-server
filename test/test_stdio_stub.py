@@ -37,14 +37,10 @@ async def test_list_tools_adopts_warm_daemon(monkeypatch):
     # 也不依赖 client 收到 list_changed 通知。
     stub = HeadlessIdaStub(port=40004)
 
-    async def _probe() -> bool:
-        return True
+    async def _handshake():
+        return "ours", [_tool("server_health"), _tool("lookup_funcs")]
 
-    async def _fetch() -> list[MCPTool]:
-        return [_tool("server_health"), _tool("lookup_funcs")]
-
-    monkeypatch.setattr(stub, "_probe_daemon", _probe)
-    monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
+    monkeypatch.setattr(stub, "_handshake", _handshake)
 
     assert [t.name for t in await stub.list_tools()] == [
         "start_daemon",
@@ -58,14 +54,10 @@ async def test_list_tools_falls_back_when_handshake_fails(monkeypatch):
     # 端口有人监听但不是我们的 daemon（握手失败/超时）时，只能给 bootstrap 面。
     stub = HeadlessIdaStub(port=40005)
 
-    async def _probe() -> bool:
-        return True
+    async def _handshake():
+        return "foreign", None
 
-    async def _fetch() -> list[MCPTool]:
-        raise RuntimeError("handshake failed")
-
-    monkeypatch.setattr(stub, "_probe_daemon", _probe)
-    monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
+    monkeypatch.setattr(stub, "_handshake", _handshake)
 
     assert [t.name for t in await stub.list_tools()] == ["start_daemon"]
 
@@ -86,29 +78,29 @@ async def test_start_daemon_stays_visible_after_activation():
 
 @pytest.mark.asyncio
 async def test_activate_respawns_dead_daemon(monkeypatch):
-    # 探测失败就意味着 daemon 已经死了，必须重新拉起并重新拉取工具面，
+    # 握手说 absent 就意味着 daemon 已经死了，必须重新拉起并重新拉取工具面，
     # 而不是把一个死进程报成 "running"。
     stub = HeadlessIdaStub(port=40001, session_mode=True)
     stub._real_tools = [_tool("stale_tool")]
-    probes = iter([False, True])
     spawn_calls = []
     notify_calls = []
 
-    async def _probe() -> bool:
-        return next(probes)
+    async def _handshake():
+        return "absent", None
 
     def _spawn() -> None:
         spawn_calls.append(True)
 
-    async def _fetch() -> list[MCPTool]:
-        return [_tool("server_health")]
+    async def _await_start() -> str:
+        stub._real_tools = [_tool("server_health")]
+        return "ready"
 
     async def _notify() -> None:
         notify_calls.append(True)
 
-    monkeypatch.setattr(stub, "_probe_daemon", _probe)
+    monkeypatch.setattr(stub, "_handshake", _handshake)
     monkeypatch.setattr(stub, "_spawn_daemon", _spawn)
-    monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
+    monkeypatch.setattr(stub, "_await_daemon_start", _await_start)
     monkeypatch.setattr(stub, "_notify_tools_changed", _notify)
 
     assert await stub._activate_daemon() == "started"

@@ -465,6 +465,13 @@ from headless_ida_mcp_server.ida_mcp.rpc import (  # noqa: E402
 )
 
 
+# Tools that must answer before any database exists. `server_health` is how a
+# client — and the stdio stub's session-identity handshake — learns what the
+# server is doing when no IDB is open yet; gating it behind the binary guard
+# made it answer "Binary path not set" exactly when it was needed most.
+_BINARY_GUARD_EXEMPT = {"server_health"}
+
+
 def _binary_required_guard(name: str):
     """Tools that touch IDA state require an open IDB. Two paths can open one:
 
@@ -479,6 +486,8 @@ def _binary_required_guard(name: str):
     """
     import headless_ida_mcp_server as _pkg
 
+    if name in _BINARY_GUARD_EXEMPT:
+        return None
     if ida is None and not getattr(_pkg, "_idb_open", False):
         return f"error: Binary path not set (call set_binary_path first; tool={name!r})"
     return None

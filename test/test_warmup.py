@@ -92,3 +92,20 @@ async def test_warmup_reports_completion_when_queue_drains(monkeypatch):
     assert out["ok"] is True
     assert out["steps"][0]["ok"] is True
     assert "error" not in out["steps"][0]
+
+
+def test_health_reports_session_token_and_works_without_an_idb(monkeypatch):
+    # The stdio stub's identity handshake runs before any binary is opened, so
+    # the health payload must answer (and carry the token) with no IDB. Other
+    # test modules may leave a database open, so only the payload shape and the
+    # token are asserted here; the no-IDB case is exercised by the real-daemon
+    # handshake in test_stub_session_identity.py.
+    monkeypatch.setenv("IDA_MCP_SESSION_TOKEN", "abc123")
+
+    payload = api_core._build_health_payload()
+
+    assert payload["status"] == "ok"
+    assert payload["session_token"] == "abc123"
+
+    monkeypatch.delenv("IDA_MCP_SESSION_TOKEN")
+    assert api_core._build_health_payload()["session_token"] is None

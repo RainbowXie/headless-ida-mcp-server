@@ -190,6 +190,31 @@ Point the MCP client at the URL:
 Useful when multiple clients share one server, or when you want the server to
 outlive any single agent session.
 
+### Multi-session isolation (`headless-ida-mcp-stub`)
+
+The `headless-ida-mcp-stub` entry point is a stdio front end that proxies to a
+streamable-http daemon. It has two modes:
+
+| Mode | Flags | Behaviour |
+|---|---|---|
+| Default | none, or `--port` / `--host` | Attaches to whatever headless-ida daemon answers that endpoint. A warm daemon on 8392 is shared by every client — not isolated. |
+| Session | `--session-mode` | Allocates an ephemeral port, spawns a daemon bound only to it, and terminates that daemon when the stub exits. Isolated per agent session. |
+
+Isolation is enforced by a session token, not just by the port. In session
+mode the stub generates `IDA_MCP_SESSION_TOKEN`, passes it to its daemon, and
+only adopts a daemon that echoes it back through `server_health`. If the
+allocated port turns out to be held by another session's daemon — or by any
+process that does not speak MCP — the stub reallocates and spawns again, up to
+three attempts, then reports:
+
+```text
+error: session port collision after 3 attempts (port 40123 is served by another process); no daemon was adopted
+```
+
+It never adopts a foreign daemon, so two sessions can never end up sharing one
+IDB. Note that the identity check reads `server_health`: a deployment that
+drops it with `--exclude-tags 'core::server'` cannot use `--session-mode`.
+
 ### stdio mode noise isolation
 
 Under `--transport stdio` the server's stdout (fd 1) IS the JSON-RPC channel
