@@ -47,6 +47,11 @@ DEFAULT_HOST = "127.0.0.1"
 # session-mode daemon child on stub exit.
 _DAEMON_TERMINATE_TIMEOUT = 5
 
+# Upper bound for fetching the daemon's tool list. A listing request must
+# never hang on a daemon that accepts the connection but does not answer
+# the MCP handshake (e.g. a foreign process holding the port).
+_TOOL_FETCH_TIMEOUT = 5
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -284,7 +289,29 @@ class HeadlessIdaStub(FastMCP):
             except Exception:
                 pass
 
+    async def _adopt_warm_daemon(self) -> None:
+        """Adopt a daemon that is already listening, without a start_daemon call.
+
+        A client only re-fetches the tool list on
+        ``notifications/tools/list_changed``, so relying on activation alone
+        leaves a restarted stub advertising the bootstrap tool until the agent
+        notices. Probing here makes the first listing complete whenever a warm
+        daemon is up.
+        """
+        if not await self._probe_daemon():
+            return
+        try:
+            self._real_tools = await asyncio.wait_for(
+                self._fetch_real_tools(), timeout=_TOOL_FETCH_TIMEOUT
+            )
+        except Exception:
+            # Unreachable handshake or a timeout: keep the bootstrap-only
+            # surface rather than advertising tools we cannot serve.
+            self._real_tools = None
+
     async def list_tools(self) -> list[MCPTool]:
+        if self._real_tools is None:
+            await self._adopt_warm_daemon()
         # ``start_daemon`` stays in the surface after activation on purpose:
         # it is the recovery path ``call_tool`` points at when the daemon dies,
         # and the client snapshots this list until the next list-changed
@@ -311,9 +338,12 @@ class HeadlessIdaStub(FastMCP):
             # A dead daemon reaches this point as an anyio ExceptionGroup from
             # the transport's TaskGroup. Leaking it into the MCP transport makes
             # the downstream client treat the stub itself as broken and discard
-            # the tool surface; return the repo-standard ``error:`` text and
-            # forget the dead daemon so the next ``start_daemon`` respawns it.
-            self._forget_daemon()
+            # the tool surface; return the repo-standard ``error:`` text instead.
+            #
+            # The cached surface is deliberately kept: it describes which tools
+            # exist, not whether the daemon is alive, and one failed call is not
+            # evidence the daemon's surface changed. Only a respawn invalidates
+            # it (`_activate_daemon`).
             return [
                 TextContent(
                     type="text",

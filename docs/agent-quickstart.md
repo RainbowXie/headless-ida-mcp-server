@@ -372,12 +372,13 @@ plugin into `~/.idapro/plugins/` (eager / global / chatty).
 
 ## 7. Tools and resources
 
-The server exposes **85 MCP tools + 11 MCP resources** (4 fork-only
-tools + 81 vendored upstream tools + 11 vendored upstream resources):
+The server exposes **90 MCP tools + 11 MCP resources** (5 fork-only
+tools + 4 session meta tools + 81 vendored upstream tools + 11 vendored
+upstream resources):
 
 | Group | Source | Examples |
 |---|---|---|
-| Lifecycle / undo | fork-only | `set_binary_path`, `unset`, `py_eval`, `undo` (call `unset` before re-`set_binary_path` to switch IDB; see §11 for the undo contract) |
+| Lifecycle / undo | fork-only | `set_binary_path`, `unset`, `analysis_status`, `py_eval`, `undo` (call `unset` before re-`set_binary_path` to switch IDB; see §11 for the undo contract and "Opening a large binary" below for the analysis contract) |
 | Core / metadata | `ida_mcp/api_core.py` | `server_health`, `lookup_funcs`, `list_funcs`, `imports`, `idb_save`, `find_regex`, `search_text` |
 | Analysis | `ida_mcp/api_analysis.py` | `decompile`, `disasm`, `xrefs_to`, `callees`, `callgraph`, `find_bytes`, `basic_blocks` |
 | Memory | `ida_mcp/api_memory.py` | `get_bytes`, `get_int`, `get_string`, `get_global_value`, `patch`, `put_int` |
@@ -424,6 +425,31 @@ Resources return `{"error": "..."}` for the same reason. `set_binary_path`
 must be called (or `IDB_PATH` set) before any tool that touches IDA state
 — the missing-binary case returns
 `error: Binary path not set (call set_binary_path first; tool=...)`.
+
+### Opening a large binary
+
+`set_binary_path` returns as soon as the IDB is open; IDA's auto-analysis
+queue keeps draining in the background. That is deliberate — draining it
+inside the call blocks the event loop for minutes on large binaries
+(measured: 77 s for a 7 MB shared library) and trips the client's per-tool
+timeout.
+
+```text
+set_binary_path(path="/tmp/libcronet.so")
+  → "Binary path set; analysis running (poll analysis_status)"
+
+analysis_status(wait_sec=30)
+  → {"state": "running", "elapsed_sec": 12.4, "functions": 8421, "queues_empty": false, ...}
+
+analysis_status(wait_sec=60)
+  → {"state": "done", "elapsed_sec": 78.4, "functions": 21609, "queues_empty": true, ...}
+```
+
+`state` is `idle` / `running` / `done` / `cancelled`; `queues_empty` comes
+from `ida_auto.auto_is_ok()`, so it is the authoritative completion signal.
+Tools called while analysis is still running work, but may see a partially
+analyzed IDB — pass `set_binary_path(path=..., wait=True)` when you need a
+ready database on return.
 
 ## 8. Typical agent workflow
 
@@ -484,6 +510,8 @@ plugin APIs, walk the database, mutate state.
 | `IDA_INSTALL_DIR is not set` | Env not threaded into the MCP client config. Check the `env` field in `.mcp.json` / `~/.claude.json`. |
 | `Binary path not set` | `IDB_PATH` not set and `set_binary_path` never called. Either set the env, or have the agent call `set_binary_path(path="/path/to/idb")` first. |
 | `error: Binary path already set ...` | A previous `set_binary_path` left the IDB loaded. Call `unset()` first, then `set_binary_path` for the new IDB. |
+| Results look partial right after `set_binary_path` | Auto-analysis is still running. Poll `analysis_status(wait_sec=...)` until `queues_empty` is true, or call `set_binary_path(path=..., wait=True)`. |
+| `set_binary_path` itself timed out | The client's per-tool timeout fired while an older build drained analysis inline. Current builds return after the open; check `analysis_status` for the real progress. |
 | Server log shows `<plugin> initialized → Terminating <plugin> ...` at startup | Normal IDA plugin auto-discovery probe. If a directory you injected via `IDA_MCP_PLUGIN_PATHS` happens to be both an importable Python package AND an IDA plugin (defines `PLUGIN_ENTRY`), idalib boots that plugin once and tears it down. Server itself is fine; agent-side `import <plugin>` still works. |
 | `from <plugin> import ...` raises `ImportError` | `IDA_MCP_PLUGIN_PATHS` does not include the plugin checkout root. Verify with `py_eval(code="import sys; sys.path[:5]")`. |
 | `ModuleNotFoundError: No module named 'idapro'` (when using `uvx`) | `--with <wheel>` was missing or pointed at wrong path. Run `find /opt/ida-pro-9.3 -name 'idapro-*.whl'` and use the actual wheel path. |
@@ -536,7 +564,7 @@ in the env from a wrapper script.
 $ uvx headless-ida-mcp-server --exclude-tags 'kind:write,kind:unsafe'
 # server log:
 # registered 64 tools (21 excluded by tag filter), 11 resources (0 excluded)
-# (4 fork-only tools: set_binary_path, unset, py_eval, undo)
+# (5 fork-only tools: set_binary_path, unset, analysis_status, py_eval, undo)
 ```
 
 The startup log always reports both totals and excluded counts so an

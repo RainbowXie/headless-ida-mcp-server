@@ -55,14 +55,15 @@ class IDA():
                 return
 
             # open_database(..., True) with auto_analysis crashes idalib 9.3
-            # on first-time ELF loads.  Open without auto_analysis and run
-            # auto_wait() manually instead.
+            # on first-time ELF loads, so the database is opened without it.
+            # Auto-analysis is not run here either: draining the queue takes
+            # minutes on large binaries and would block the caller's event
+            # loop, so `analysis.py` drives it as a background pump.
             rc = idapro.open_database(binary_path, False)
             if rc != 0:
                 self.open = False
                 print(f"Failed to open database: {binary_path} (rc={rc})")
                 return
-            idaapi.auto_wait()
             self.open = True
         except Exception as e:
             self.open = False

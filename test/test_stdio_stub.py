@@ -18,12 +18,56 @@ def test_stdio_stub_import():
 
 
 @pytest.mark.asyncio
-async def test_headless_ida_stub_list_tools_initial():
-    # 在 daemon 未启动时，list_tools 应当返回初始引导工具 start_daemon
+async def test_headless_ida_stub_list_tools_initial(monkeypatch):
+    # 没有 daemon 应答时，list_tools 应当只返回初始引导工具 start_daemon
     stub = HeadlessIdaStub()
+
+    async def _no_daemon() -> bool:
+        return False
+
+    monkeypatch.setattr(stub, "_probe_daemon", _no_daemon)
     tools = await stub.list_tools()
     assert len(tools) == 1
     assert tools[0].name == "start_daemon"
+
+
+@pytest.mark.asyncio
+async def test_list_tools_adopts_warm_daemon(monkeypatch):
+    # 热 daemon 已就绪时，第一次列表就要给出完整工具面，不需要先调 start_daemon，
+    # 也不依赖 client 收到 list_changed 通知。
+    stub = HeadlessIdaStub(port=40004)
+
+    async def _probe() -> bool:
+        return True
+
+    async def _fetch() -> list[MCPTool]:
+        return [_tool("server_health"), _tool("lookup_funcs")]
+
+    monkeypatch.setattr(stub, "_probe_daemon", _probe)
+    monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
+
+    assert [t.name for t in await stub.list_tools()] == [
+        "start_daemon",
+        "server_health",
+        "lookup_funcs",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_tools_falls_back_when_handshake_fails(monkeypatch):
+    # 端口有人监听但不是我们的 daemon（握手失败/超时）时，只能给 bootstrap 面。
+    stub = HeadlessIdaStub(port=40005)
+
+    async def _probe() -> bool:
+        return True
+
+    async def _fetch() -> list[MCPTool]:
+        raise RuntimeError("handshake failed")
+
+    monkeypatch.setattr(stub, "_probe_daemon", _probe)
+    monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
+
+    assert [t.name for t in await stub.list_tools()] == ["start_daemon"]
 
 
 @pytest.mark.asyncio
@@ -48,6 +92,7 @@ async def test_activate_respawns_dead_daemon(monkeypatch):
     stub._real_tools = [_tool("stale_tool")]
     probes = iter([False, True])
     spawn_calls = []
+    notify_calls = []
 
     async def _probe() -> bool:
         return next(probes)
@@ -58,18 +103,19 @@ async def test_activate_respawns_dead_daemon(monkeypatch):
     async def _fetch() -> list[MCPTool]:
         return [_tool("server_health")]
 
-    async def _noop() -> None:
-        return None
+    async def _notify() -> None:
+        notify_calls.append(True)
 
     monkeypatch.setattr(stub, "_probe_daemon", _probe)
     monkeypatch.setattr(stub, "_spawn_daemon", _spawn)
     monkeypatch.setattr(stub, "_fetch_real_tools", _fetch)
-    monkeypatch.setattr(stub, "_notify_tools_changed", _noop)
+    monkeypatch.setattr(stub, "_notify_tools_changed", _notify)
 
     assert await stub._activate_daemon() == "started"
     assert spawn_calls == [True]
-    # 旧 daemon 的工具面不能残留：新 daemon 的工具面要重新拉取。
+    # 旧 daemon 的工具面不能残留：新 daemon 的工具面要重新拉取，并通知 client 重取。
     assert [t.name for t in stub._real_tools] == ["server_health"]
+    assert notify_calls == [True]
 
 
 @pytest.mark.asyncio
@@ -119,4 +165,5 @@ async def test_call_tool_reports_dead_daemon_as_error_text(monkeypatch):
     assert len(result) == 1
     assert result[0].text.startswith("error: daemon unreachable")
     assert "start_daemon" in result[0].text
-    assert stub._real_tools is None
+    # 工具面描述的是"有哪些工具"，一次转发失败不代表 daemon 换了工具面。
+    assert [t.name for t in stub._real_tools] == ["server_health"]

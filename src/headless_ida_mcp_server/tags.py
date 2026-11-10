@@ -63,9 +63,9 @@ Vendored breakdown (81 entries)
   instruction / data definitions; the re-disassembly path after an
   ``ida_undo`` may not be exact).
 
-Fork-only entries (4 -- ``set_binary_path`` / ``unset`` / ``py_eval`` /
-``undo``) live in ``server.py`` directly and are listed here so the
-filter and undo logic apply uniformly.
+Fork-only entries (5 -- ``set_binary_path`` / ``unset`` /
+``analysis_status`` / ``py_eval`` / ``undo``) live in ``server.py``
+directly and are listed here so the filter and undo logic apply uniformly.
 """
 from __future__ import annotations
 
@@ -85,6 +85,9 @@ TOOL_TAGS: Dict[str, List[str]] = {
     "set_binary_path": ["kind:write", "core::lifecycle"],
     # unset closes the IDB. ida_undo cannot recover a closed session.
     "unset": ["kind:unsafe", "core::lifecycle"],
+    # analysis_status only reads the pump's snapshot and IDA's queue state;
+    # it never mutates the IDB, so it stays usable in read-only mode.
+    "analysis_status": ["kind:read", "core::server"],
     # py_eval runs arbitrary Python: filesystem, network, sys.path,
     # os.unlink(IDB_PATH) etc. ida_undo cannot recover any of that.
     "py_eval": ["kind:unsafe", "ext::py_eval"],

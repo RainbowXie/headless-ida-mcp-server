@@ -63,6 +63,7 @@ from mcp.server.fastmcp.prompts import base
 from mcp.server.lowlevel.server import NotificationOptions
 from mcp.types import Tool as MCPTool
 
+from headless_ida_mcp_server import analysis
 from headless_ida_mcp_server.helper import IDA
 from headless_ida_mcp_server.logger import logger
 from headless_ida_mcp_server import PORT, TRANSPORT
@@ -93,14 +94,14 @@ from headless_ida_mcp_server.plugins import session_state as _session_state
 # IDA_MCP_EXCLUDE_TAGS (set by `__main__.py` from --exclude-tags). Empty
 # pattern list = no filtering. The filter applies uniformly to every
 # tool / resource registration site below: vendored upstream loop,
-# resource loop, and the four fork-only tools.
+# resource loop, and the five fork-only tools.
 _EXCLUDE_PATTERNS: list[str] = parse_exclude_patterns(
     os.environ.get("IDA_MCP_EXCLUDE_TAGS", "")
 )
 
 _MCP_INSTRUCTIONS = """\
 This server analyzes binaries via IDA Pro headlessly. The MCP layer exposes
-up to 85 tools and 11 resources backed by an in-process idalib SDK session
+up to 90 tools and 11 resources backed by an in-process idalib SDK session
 (some may be filtered out by the operator's capability tag config — see
 the conventions block below).
 
@@ -326,7 +327,12 @@ def _create_undo_point(action_name: str) -> None:
 # ----------------------------------------------------------------------------
 # Lifecycle tools (idalib-specific, not in upstream)
 # ----------------------------------------------------------------------------
-def _set_binary_path_impl(path: Annotated[str, "Path to the binary file"]):
+async def _set_binary_path_impl(
+    path: Annotated[str, "Path to the binary file"],
+    wait: Annotated[
+        bool, "Block until IDA auto-analysis finishes (default: return after open)"
+    ] = False,
+):
     """Set the path to the binary file (opens the IDB via idalib)."""
     global ida
     if ida is not None:
@@ -349,7 +355,19 @@ def _set_binary_path_impl(path: Annotated[str, "Path to the binary file"]):
             _api_core.invalidate_strings_cache()
         except Exception:  # pragma: no cover - best effort
             pass
-        return "Binary path set"
+        # Analysis is NOT drained here by default: on a large binary that is
+        # minutes of blocking the event loop, which trips the client's
+        # per-tool timeout. The pump runs on the loop and reports through
+        # `analysis_status`.
+        analysis.start()
+        if wait:
+            finished = await analysis.wait(None)
+            return (
+                "Binary path set; analysis finished"
+                if finished
+                else "Binary path set; analysis stopped before the queue drained"
+            )
+        return "Binary path set; analysis running (poll analysis_status)"
     else:
         ida = None
         return "Failed to set binary path"
@@ -360,11 +378,14 @@ def _set_binary_path_impl(path: Annotated[str, "Path to the binary file"]):
 _set_binary_path_impl.__name__ = "set_binary_path"
 
 
-def _unset_impl():
+async def _unset_impl():
     """Close the IDA database and unset the binary path."""
     global ida
     if ida is None:
         return "error: Binary path not set"
+    # Stop the pump before closing: a task still inside `auto_make_step` would
+    # touch a database that no longer exists.
+    await analysis.stop()
     ida.clean_up()
     ida = None
     import headless_ida_mcp_server as _pkg
@@ -395,6 +416,25 @@ else:
 
 if not is_excluded("unset", _EXCLUDE_PATTERNS):
     mcp.add_tool(_unset_impl, structured_output=False)
+else:
+    _excluded_fork_tools += 1
+
+
+async def _analysis_status_impl(
+    wait_sec: Annotated[
+        float, "Block up to this many seconds waiting for analysis to finish"
+    ] = 0.0,
+):
+    """Report IDA auto-analysis state, optionally waiting for completion."""
+    if wait_sec > 0:
+        await analysis.wait(wait_sec)
+    return analysis.snapshot()
+
+
+_analysis_status_impl.__name__ = "analysis_status"
+
+if not is_excluded("analysis_status", _EXCLUDE_PATTERNS):
+    mcp.add_tool(_analysis_status_impl, structured_output=False)
 else:
     _excluded_fork_tools += 1
 
@@ -444,6 +484,39 @@ def _binary_required_guard(name: str):
     return None
 
 
+def _pre_tool_call(name: str, needs_undo: bool):
+    """Shared guard + undo-point step. Returns an error string or ``None``."""
+    guard = _binary_required_guard(name)
+    if guard is not None:
+        return guard
+    if needs_undo:
+        # Best-effort: failures are logged but never block the
+        # tool call (the wrapper catches its own exceptions inside
+        # _create_undo_point).
+        _create_undo_point(name)
+    return None
+
+
+def _run_sync_tool(name: str, fn, args: tuple, kwargs: dict):
+    try:
+        return fn(*args, **kwargs)
+    except IDAError as exc:
+        return f"error: {exc.message}"
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("tool %s raised: %s", name, exc)
+        return f"error: {type(exc).__name__}: {exc}"
+
+
+async def _run_async_tool(name: str, fn, args: tuple, kwargs: dict):
+    try:
+        return await fn(*args, **kwargs)
+    except IDAError as exc:
+        return f"error: {exc.message}"
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("tool %s raised: %s", name, exc)
+        return f"error: {type(exc).__name__}: {exc}"
+
+
 def _make_tool_wrapper(name: str, fn):
     """Wrap a vendored upstream tool so:
       - exceptions become structured error strings (no transport drop),
@@ -453,6 +526,11 @@ def _make_tool_wrapper(name: str, fn):
         ``undo()`` call rolls back the side effect),
       - the FastMCP-visible signature mirrors the original (annotations
         and docstring preserved via `functools.wraps` + `__signature__`).
+
+    Coroutine tools keep their async nature: FastMCP awaits them, so the
+    event loop stays free while they wait (e.g. `server_warmup`'s bounded
+    analysis wait). A sync wrapper around a coroutine would hand FastMCP the
+    coroutine object instead of its result.
     """
     sig = inspect.signature(fn)
     # Compute once at registration time. ``kind:read`` and
@@ -461,23 +539,23 @@ def _make_tool_wrapper(name: str, fn):
     # so creating one would just be misleading noise.
     needs_undo = "kind:write" in tags_for(name)
 
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        guard = _binary_required_guard(name)
-        if guard is not None:
-            return guard
-        if needs_undo:
-            # Best-effort: failures are logged but never block the
-            # tool call (the wrapper catches its own exceptions inside
-            # _create_undo_point).
-            _create_undo_point(name)
-        try:
-            return fn(*args, **kwargs)
-        except IDAError as exc:
-            return f"error: {exc.message}"
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("tool %s raised: %s", name, exc)
-            return f"error: {type(exc).__name__}: {exc}"
+    if inspect.iscoroutinefunction(fn):
+
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            guard = _pre_tool_call(name, needs_undo)
+            if guard is not None:
+                return guard
+            return await _run_async_tool(name, fn, args, kwargs)
+
+    else:
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            guard = _pre_tool_call(name, needs_undo)
+            if guard is not None:
+                return guard
+            return _run_sync_tool(name, fn, args, kwargs)
 
     # Preserve the original signature so FastMCP's schema generator (Pydantic)
     # sees the typed parameters / return annotation. functools.wraps copies
@@ -579,7 +657,13 @@ for _uri, _fn in MCP_RESOURCES:
 # default and is reported here so maintainers can update tags.py after
 # an upstream sync.
 # ----------------------------------------------------------------------------
-_FORK_ONLY_NAMES: set[str] = {"set_binary_path", "unset", "py_eval", "undo"}
+_FORK_ONLY_NAMES: set[str] = {
+    "set_binary_path",
+    "unset",
+    "analysis_status",
+    "py_eval",
+    "undo",
+}
 _observed_tool_names = {name for name, _ in MCP_TOOLS} | _FORK_ONLY_NAMES
 _untagged = sorted(_observed_tool_names - set(TOOL_TAGS.keys()))
 if _untagged:
@@ -592,7 +676,8 @@ if _untagged:
 
 # Total registered tool count includes the fork-only block (which has
 # its own excluded counter). Fork-only contributes set_binary_path /
-# unset / py_eval (registered above) and `undo` (registered below).
+# unset / analysis_status / py_eval (registered above) and `undo`
+# (registered below).
 _undo_excluded = 1 if is_excluded("undo", _EXCLUDE_PATTERNS) else 0
 
 
@@ -603,10 +688,10 @@ def _emit_registration_log() -> None:
     plugin registration have both completed.
     """
     total_tools = len(_REGISTERED_TOOLS) + (
-        # Fork-only contribution: 4 candidate slots minus what the
+        # Fork-only contribution: 5 candidate slots minus what the
         # filter dropped (counted in `_excluded_fork_tools` for the
-        # three lifecycle entries plus `_undo_excluded` for `undo`).
-        4 - _excluded_fork_tools - _undo_excluded
+        # four lifecycle entries plus `_undo_excluded` for `undo`).
+        5 - _excluded_fork_tools - _undo_excluded
     )
     total_excluded = _excluded_tools + _excluded_fork_tools + _undo_excluded
     plugin_tool_count = len(_PLUGIN_DISPATCH)
@@ -617,8 +702,8 @@ def _emit_registration_log() -> None:
         "registered %d tools (%d excluded by tag filter), %d resources "
         "(%d excluded), %d plugin tools across %d plugins "
         "(%d plugin tools excluded; %d session-visible candidates); "
-        "session-default enabled = empty (4 fork-only tools: "
-        "set_binary_path, unset, py_eval, undo; 4 meta tools: "
+        "session-default enabled = empty (5 fork-only tools: "
+        "set_binary_path, unset, analysis_status, py_eval, undo; 4 meta tools: "
         "plugins, plugin_tools, enable_plugin, disable_plugin)",
         total_tools,
         total_excluded,

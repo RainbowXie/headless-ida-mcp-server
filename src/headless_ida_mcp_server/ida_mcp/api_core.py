@@ -30,6 +30,7 @@ import ida_nalt
 import ida_typeinf
 import idc
 
+from .. import analysis
 from .rpc import tool
 from .sync import idasync
 from .utils import (
@@ -389,24 +390,32 @@ def server_health() -> ServerHealthResult:
 
 @tool
 @idasync
-def server_warmup(
+async def server_warmup(
     wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
     build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
+    auto_wait_sec: Annotated[
+        float, "Budget for the auto-analysis wait (seconds)"
+    ] = 30.0,
 ) -> ServerWarmupResult:
     """Warm up IDA subsystems to reduce first-call latency and transient failures."""
     steps = []
 
     if wait_auto_analysis:
         t0 = time.perf_counter()
-        ida_auto.auto_wait()
-        steps.append(
-            {
-                "step": "auto_wait",
-                "ok": True,
-                "ms": round((time.perf_counter() - t0) * 1000, 2),
-            }
-        )
+        # Bounded on purpose: an unbounded `auto_wait()` blocks the event loop
+        # for the whole analysis and trips the client's per-tool timeout. The
+        # pump started by `set_binary_path` keeps draining the queue after
+        # this call returns.
+        finished = await analysis.wait(auto_wait_sec)
+        step = {
+            "step": "auto_wait",
+            "ok": finished,
+            "ms": round((time.perf_counter() - t0) * 1000, 2),
+        }
+        if not finished:
+            step["error"] = f"analysis still running after {auto_wait_sec}s"
+        steps.append(step)
 
     if build_caches:
         t0 = time.perf_counter()
