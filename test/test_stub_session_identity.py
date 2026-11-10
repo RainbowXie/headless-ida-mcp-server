@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,6 +227,44 @@ async def test_foreign_daemon_is_never_adopted(monkeypatch):
     assert stub._real_tools is None
 
 
+@pytest.mark.asyncio
+async def test_session_mode_refuses_to_forward_before_adoption(monkeypatch):
+    # The advertised surface already hides a foreign daemon's tools, but a
+    # client can still name one directly; the forwarding gate must hold.
+    stub = HeadlessIdaStub(port=40017, session_mode=True)
+
+    def _boom(_url):
+        raise AssertionError("must not open a transport before adoption")
+
+    monkeypatch.setattr(stdio_stub, "streamable_http_client", _boom)
+
+    result = await stub.call_tool("server_health", {})
+
+    assert result[0].text.startswith("error: no daemon adopted for this session")
+
+
+@pytest.mark.asyncio
+async def test_default_mode_forwards_without_adoption(monkeypatch):
+    # Default mode deliberately attaches to whatever answers the endpoint, so
+    # the session-mode gate must not apply there.
+    stub = HeadlessIdaStub(port=40018)
+
+    class _ForwardSession(_FakeSession):
+        async def call_tool(self, _name, _arguments):
+            from mcp.types import TextContent
+
+            return SimpleNamespace(content=[TextContent(type="text", text="forwarded")])
+
+    monkeypatch.setattr(
+        stdio_stub, "streamable_http_client", lambda _url: _FakeTransport()
+    )
+    monkeypatch.setattr(stdio_stub, "ClientSession", lambda _r, _w: _ForwardSession(token=None))
+
+    result = await stub.call_tool("server_health", {})
+
+    assert result[0].text == "forwarded"
+
+
 # ---------------------------------------------------------------------------
 # Collision recovery
 # ---------------------------------------------------------------------------
@@ -309,6 +348,58 @@ async def test_exited_child_ends_the_wait_immediately(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_repeated_child_exits_do_not_report_a_collision(monkeypatch):
+    stub = HeadlessIdaStub(port=40030, session_mode=True)
+
+    async def _handshake():
+        return "absent", None
+
+    def _spawn() -> None:
+        stub._daemon_proc = _FakeProc(exit_code=9)
+
+    async def _await_start() -> str:
+        return "exited"
+
+    monkeypatch.setattr(stub, "_handshake", _handshake)
+    monkeypatch.setattr(stub, "_spawn_daemon", _spawn)
+    monkeypatch.setattr(stub, "_await_daemon_start", _await_start)
+
+    result = await stub._activate_daemon()
+
+    assert result.startswith("error: daemon failed to start after 3 attempts")
+    assert "port collision" not in result
+    assert "code 9" in result
+
+
+@pytest.mark.asyncio
+async def test_reactivation_waits_on_a_live_child(monkeypatch):
+    # Design D4: a failed handshake while our own child is alive means "not
+    # serving yet". Re-activating must not kill it and jump to another port.
+    stub = HeadlessIdaStub(port=40031, session_mode=True)
+    stub._daemon_proc = _FakeProc(exit_code=None)
+    reallocations: list[bool] = []
+
+    async def _handshake():
+        return "foreign", None
+
+    async def _await_start() -> str:
+        stub._real_tools = [_tool("server_health")]
+        return "ready"
+
+    async def _notify() -> None:
+        return None
+
+    monkeypatch.setattr(stub, "_handshake", _handshake)
+    monkeypatch.setattr(stub, "_await_daemon_start", _await_start)
+    monkeypatch.setattr(stub, "_notify_tools_changed", _notify)
+    monkeypatch.setattr(stub, "_reallocate_port", lambda: reallocations.append(True))
+
+    assert await stub._activate_daemon() == "started"
+    assert reallocations == []
+    assert stub._port == 40031
+
+
+@pytest.mark.asyncio
 async def test_a_live_child_is_waited_on_not_replaced(monkeypatch):
     # uvicorn binds before the app is ready, so a failed handshake while our
     # own child is alive must not be read as a collision.
@@ -382,6 +473,11 @@ async def test_concurrent_session_stubs_stay_isolated(tmp_path):
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                # The bootstrap tool description carries this stub's port, which
+                # is the only endpoint the client can observe.
+                listing = await session.list_tools()
+                bootstrap = next(t for t in listing.tools if t.name == "start_daemon")
+                port = int(re.search(r"port (\d+)", bootstrap.description or "").group(1))
                 assert (await session.call_tool("start_daemon", {})).content[0].text == (
                     "started"
                 )
@@ -390,12 +486,14 @@ async def test_concurrent_session_stubs_stay_isolated(tmp_path):
                     (await session.call_tool("server_health", {})).content[0].text
                 )
                 return {
+                    "port": port,
                     "token": health["session_token"],
                     "idb_path": health["idb_path"],
                 }
 
     first, second = await asyncio.gather(_run("iso_a"), _run("iso_b"))
 
+    assert first["port"] != second["port"]
     assert first["token"] and second["token"]
     assert first["token"] != second["token"]
     assert first["idb_path"] != second["idb_path"]

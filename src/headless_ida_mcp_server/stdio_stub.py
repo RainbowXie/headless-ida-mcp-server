@@ -339,6 +339,7 @@ class HeadlessIdaStub(FastMCP):
         """Spawn, wait, and retry on a new port when session mode collides."""
         attempts = _MAX_PORT_ATTEMPTS if self._session_mode else 1
         last = ""
+        collided = False
         for attempt in range(attempts):
             if attempt:
                 # The previous attempt lost its port; move before spawning again
@@ -351,11 +352,12 @@ class HeadlessIdaStub(FastMCP):
             if outcome == "ready":
                 await self._notify_tools_changed()
                 return "started"
+            collided = outcome == "foreign"
             if outcome == "exited":
                 proc = self._daemon_proc
                 code = proc.poll() if proc is not None else None
                 last = f"daemon on port {self._port} exited during startup (code {code})"
-            elif outcome == "foreign":
+            elif collided:
                 last = f"port {self._port} is served by another process"
             else:
                 last = (
@@ -364,8 +366,12 @@ class HeadlessIdaStub(FastMCP):
                 )
             if not self._session_mode:
                 return f"error: {last}"
+        # Name the cause that actually ended the last attempt: three child exits
+        # are not a port collision, and reporting one would send the operator
+        # hunting for a port conflict that does not exist.
+        header = "session port collision" if collided else "daemon failed to start"
         return (
-            f"error: session port collision after {attempts} attempts ({last}); "
+            f"error: {header} after {attempts} attempts ({last}); "
             "no daemon was adopted"
         )
 
@@ -388,9 +394,18 @@ class HeadlessIdaStub(FastMCP):
                             f"error: {self._daemon_url} is served by another "
                             "process; refusing to adopt it"
                         )
-                    # Another session grabbed the port we were handed: move on
-                    # before spawning, otherwise our child could not bind.
-                    self._reallocate_port()
+                    proc = self._daemon_proc
+                    if proc is not None and proc.poll() is None:
+                        # Design D4: our own child is alive, so a failed
+                        # handshake means "not serving yet", not a collision.
+                        # Wait on it rather than killing it and moving away.
+                        if await self._await_daemon_start() == "ready":
+                            await self._notify_tools_changed()
+                            return "started"
+                    else:
+                        # No live child of ours: the port really is someone
+                        # else's, so move before spawning.
+                        self._reallocate_port()
                 return await self._spawn_with_recovery()
         except Exception as exc:
             # Spawn / MCP handshake failures (port stolen by a non-MCP
@@ -444,6 +459,22 @@ class HeadlessIdaStub(FastMCP):
         if name == "start_daemon":
             status = await self._activate_daemon()
             return [TextContent(type="text", text=status)]
+
+        if self._session_mode and self._real_tools is None:
+            # Session mode may only talk to a daemon it has verified. The
+            # advertised surface already hides other sessions' tools, but a
+            # client can still name one directly, and the endpoint may be held
+            # by a foreign daemon — so the gate lives here, not only in
+            # `list_tools`.
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "error: no daemon adopted for this session; "
+                        "call start_daemon first"
+                    ),
+                )
+            ]
 
         try:
             async with streamable_http_client(self._daemon_url) as (read, write, _):

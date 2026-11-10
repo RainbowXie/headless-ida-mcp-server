@@ -212,7 +212,9 @@ error: session port collision after 3 attempts (port 40123 is served by another 
 ```
 
 It never adopts a foreign daemon, so two sessions can never end up sharing one
-IDB. Note that the identity check reads `server_health`: a deployment that
+IDB. The stub also refuses to forward any tool call until it has adopted its
+own daemon, so naming a tool that was never advertised cannot reach a foreign
+endpoint. Note that the identity check reads `server_health`: a deployment that
 drops it with `--exclude-tags 'core::server'` cannot use `--session-mode`.
 
 ### stdio mode noise isolation
